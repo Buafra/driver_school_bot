@@ -1,15 +1,10 @@
 # driver_school_bot.py
-# DriverSchoolBot — Shared Ledger for Driver Extra Trips
-# Features:
-# - Shared ledger (all authorized users share one account)
-# - Weekly report (Mon → now) + auto report Friday 10:00 (Dubai)
-# - No school / holiday / remove no-school
-# - Test mode: test trips ignored in real totals
-# - Buttons UI (/menu)
-# - Clear all trips
-#
-# Requirements:
-#   python-telegram-bot[job-queue]==21.4
+# Shared-ledger driver trips bot:
+# - One ledger shared by all authorized users (you + Abdulla)
+# - Weekly/monthly/yearly reports
+# - No-school / holiday adjustments
+# - Weekly auto report Friday 10:00 (Dubai time)
+# Requires: python-telegram-bot[job-queue]==21.4
 
 import os
 import json
@@ -18,20 +13,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
-from telegram import (
-    Update,
-    InputFile,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    JobQueue,
-    MessageHandler,
-    filters,
-)
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 
 # --------- Constants & Storage ---------
 
@@ -40,24 +23,11 @@ DEFAULT_BASE_WEEKLY = 725.0  # AED
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 SCHOOL_DAYS_PER_WEEK = 5
 
-# Authorized users
+# Authorized users (user IDs you gave me)
 ALLOWED_USERS = [
     7698278415,  # Faisal
     5034920293,  # Abdulla
 ]
-
-# Buttons labels (for /menu keyboard)
-BTN_ADD_TRIP = "➕ Add Trip"
-BTN_LIST = "📋 List Trips"
-BTN_REPORT = "📊 Weekly Report"
-BTN_MONTH = "📅 Month"
-BTN_YEAR = "📆 Year"
-BTN_NOSCHOOL = "🏫 No School Today"
-BTN_REMOVESCHOOL = "❌ Remove No School"
-BTN_HOLIDAY = "🎉 Holiday Range"
-BTN_EXPORT = "📄 Export CSV"
-BTN_TOGGLE_TEST = "🧪 Toggle Test Mode"
-BTN_CLEAR_TRIPS = "🧹 Clear All Trips"
 
 
 def load_data() -> Dict[str, Any]:
@@ -86,15 +56,13 @@ def ensure_structure(data: Dict[str, Any]) -> Dict[str, Any]:
     if "base_weekly" not in data:
         data["base_weekly"] = DEFAULT_BASE_WEEKLY
     if "trips" not in data:
-        data["trips"] = []  # list of {id, date, amount, destination, user_id, user_name, is_test}
+        data["trips"] = []  # list of {id, date, amount, destination, user_id, user_name}
     if "next_trip_id" not in data:
         data["next_trip_id"] = 1
     if "no_school_dates" not in data:
         data["no_school_dates"] = []  # list of "YYYY-MM-DD"
     if "subscribers" not in data:
         data["subscribers"] = []  # chat_ids to receive weekly report
-    if "test_mode" not in data:
-        data["test_mode"] = False  # global test mode flag
     return data
 
 
@@ -185,16 +153,9 @@ def week_range_now() -> (datetime, datetime):
     """Return (start_of_week_Monday_00:00, now) in Dubai time."""
     now = datetime.now(DUBAI_TZ)
     week_start_date = now.date() - timedelta(days=now.weekday())  # Monday
-    since = datetime(
-        week_start_date.year, week_start_date.month, week_start_date.day,
-        0, 0, tzinfo=DUBAI_TZ
-    )
+    since = datetime(week_start_date.year, week_start_date.month, week_start_date.day,
+                     0, 0, tzinfo=DUBAI_TZ)
     return since, now
-
-
-def is_real_trip(trip: Dict[str, Any]) -> bool:
-    """True if trip should count in real totals (not test)."""
-    return not trip.get("is_test", False)
 
 
 # --------- Authorization ---------
@@ -213,12 +174,11 @@ async def ensure_authorized(update: Update) -> bool:
 def build_weekly_report_text(data: Dict[str, Any],
                              since: datetime,
                              until: datetime) -> str:
-    trips_all = data["trips"]
+    trips = data["trips"]
     base = data["base_weekly"]
     no_school = data["no_school_dates"]
 
-    period_raw = filter_trips_by_period(trips_all, since, until)
-    period_trips = [t for t in period_raw if is_real_trip(t)]
+    period_trips = filter_trips_by_period(trips, since, until)
     total_extra = sum(t["amount"] for t in period_trips)
 
     ns_days = no_school_days_in_period(no_school, since, until)
@@ -230,8 +190,8 @@ def build_weekly_report_text(data: Dict[str, Any],
     lines = [
         f"📊 *Weekly Driver Report* ({period_str})",
         "",
-        f"🧾 Extra trips count (real): *{len(period_trips)}*",
-        f"💰 Extra trips total (real): *{total_extra:.2f} AED*",
+        f"🧾 Extra trips count: *{len(period_trips)}*",
+        f"💰 Extra trips total: *{total_extra:.2f} AED*",
         "",
         f"🎓 Base weekly (full): *{base:.2f} AED*",
         f"📅 No-school days this week: *{ns_days}*",
@@ -241,7 +201,7 @@ def build_weekly_report_text(data: Dict[str, Any],
     ]
 
     if period_trips:
-        lines.append("\n📋 Trip details (real trips only):")
+        lines.append("\n📋 Trip details:")
         for t in period_trips:
             dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
             d_str = dt.strftime("%Y-%m-%d")
@@ -252,29 +212,24 @@ def build_weekly_report_text(data: Dict[str, Any],
     return "\n".join(lines)
 
 
-# --------- Commands ---------
+# --------- Command Handlers ---------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Always reply to /start and show the user's Telegram ID + auth status."""
-    user = update.effective_user
+    if not await ensure_authorized(update):
+        return
+
     chat_id = update.effective_chat.id
     data = load_data()
 
-    # Register chat as subscriber for weekly reports
+    # register this chat as a subscriber for weekly reports
     if chat_id not in data["subscribers"]:
         data["subscribers"].append(chat_id)
         save_data(data)
 
-    user_id = user.id if user else None
-    is_auth = user_id in ALLOWED_USERS
-
     msg = (
         "👋 *DriverSchoolBot — Shared Ledger*\n\n"
-        "All trips from you and Abdulla go into *one* account.\n\n"
-        f"👤 Your Telegram ID: `{user_id}`\n"
-        f"🔐 Authorized: *{'YES ✅' if is_auth else 'NO ❌'}*\n\n"
+        "All trips from you and Abdulla go into *one* ledger.\n\n"
         "Main commands:\n"
-        "• `/menu` — show buttons menu\n"
         "• `/trip <amount> <destination>` – add extra trip\n"
         "• `/list` – list all trips (you + Abdulla)\n"
         "• `/report` – this week’s report (Mon → now)\n"
@@ -284,22 +239,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/filter YYYY-MM-DD` – trips on a specific day\n"
         "• `/destination <keyword>` – filter by destination\n"
         "• `/export` – export all trips as CSV\n"
-        "• `/setbase <amount>` – change weekly base (default 725 AED)\n"
-        "• `/cleartrips` – delete *all* trips (real + test)\n\n"
+        "• `/setbase <amount>` – change weekly base (default 725 AED)\n\n"
         "Holidays / No school:\n"
         "• `/noschool` — mark *today* as no-school\n"
         "• `/noschool YYYY-MM-DD` — mark specific day\n"
-        "• `/holiday YYYY-MM-DD YYYY-MM-DD` — mark range as no-school\n"
-        "• `/removeschool` or `/removeschool YYYY-MM-DD` — unmark a no-school day\n\n"
-        "Test mode:\n"
-        "• `/test_on` — new trips become TEST (ignored in totals)\n"
-        "• `/test_off` — back to normal\n\n"
+        "• `/holiday YYYY-MM-DD YYYY-MM-DD` — mark range as no-school\n\n"
         "🔔 Auto weekly report every *Friday 10:00 (Dubai)*."
     )
 
-    if update.message:
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def set_base(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -347,8 +295,6 @@ async def add_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     trip_id = data["next_trip_id"]
     data["next_trip_id"] += 1
 
-    is_test = data.get("test_mode", False)
-
     trip = {
         "id": trip_id,
         "date": now.isoformat(),
@@ -356,16 +302,14 @@ async def add_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "destination": destination,
         "user_id": update.effective_user.id,
         "user_name": update.effective_user.first_name or "User",
-        "is_test": is_test,
     }
     data["trips"].append(trip)
     save_data(data)
 
     pretty = now.strftime("%Y-%m-%d %H:%M")
-    test_label = "🧪 [TEST] " if is_test else ""
 
     await update.message.reply_text(
-        f"✅ {test_label}Trip added\n"
+        f"✅ Trip added\n"
         f"🆔 ID: {trip_id}\n"
         f"📅 {pretty}\n"
         f"📍 {destination}\n"
@@ -385,26 +329,16 @@ async def list_trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     lines = ["📋 *All trips (shared ledger):*"]
-    real_total = 0.0
-    test_total = 0.0
-
+    total = 0.0
     for t in sorted(trips, key=lambda x: x["id"]):
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         d_str = dt.strftime("%Y-%m-%d")
-        is_test = t.get("is_test", False)
-        tag = " 🧪[TEST]" if is_test else ""
-        if is_test:
-            test_total += t["amount"]
-        else:
-            real_total += t["amount"]
-
+        total += t["amount"]
         lines.append(
-            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED*{tag} "
-            f"(by {t.get('user_name','?')})"
+            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* (by {t.get('user_name','?')})"
         )
 
-    lines.append(f"\n💰 Real trips total: *{real_total:.2f} AED*")
-    lines.append(f"🧪 Test trips total (ignored in reports): *{test_total:.2f} AED*")
+    lines.append(f"\n💰 Total extra (all time): *{total:.2f} AED*")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -426,7 +360,7 @@ async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     data = load_data()
-    trips_all = data["trips"]
+    trips = data["trips"]
 
     today = datetime.now(DUBAI_TZ)
     if context.args:
@@ -436,34 +370,24 @@ async def month_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             year = int(year_str)
             month = int(month_str)
         except Exception:
-            await update.message.reply_text(
-                "Use: `/month YYYY-MM` e.g. `/month 2025-11`",
-                parse_mode="Markdown",
-            )
+            await update.message.reply_text("Use: `/month YYYY-MM` e.g. `/month 2025-11`",
+                                            parse_mode="Markdown")
             return
     else:
         year, month = today.year, today.month
 
-    raw = filter_trips_by_month(trips_all, year, month)
-    m_trips = [t for t in raw if is_real_trip(t)]
-
+    m_trips = filter_trips_by_month(trips, year, month)
     if not m_trips:
-        await update.message.reply_text(f"No *real* trips in {year}-{month:02d}.", parse_mode="Markdown")
+        await update.message.reply_text(f"No trips in {year}-{month:02d}.")
         return
 
     total = sum(t["amount"] for t in m_trips)
-    lines = [
-        f"📅 *Monthly Report {year}-{month:02d}*",
-        f"💰 Extra total (real trips): *{total:.2f} AED*",
-        "",
-        "📋 Details:",
-    ]
+    lines = [f"📅 *Monthly Report {year}-{month:02d}*", f"💰 Extra total: *{total:.2f} AED*", "", "📋 Details:"]
     for t in sorted(m_trips, key=lambda x: x["id"]):
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         d_str = dt.strftime("%Y-%m-%d")
         lines.append(
-            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* "
-            f"(by {t.get('user_name','?')})"
+            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* (by {t.get('user_name','?')})"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -474,7 +398,7 @@ async def year_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     data = load_data()
-    trips_all = data["trips"]
+    trips = data["trips"]
 
     today = datetime.now(DUBAI_TZ)
     if context.args:
@@ -486,26 +410,18 @@ async def year_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         year = today.year
 
-    raw = filter_trips_by_year(trips_all, year)
-    y_trips = [t for t in raw if is_real_trip(t)]
-
+    y_trips = filter_trips_by_year(trips, year)
     if not y_trips:
-        await update.message.reply_text(f"No *real* trips in {year}.", parse_mode="Markdown")
+        await update.message.reply_text(f"No trips in {year}.")
         return
 
     total = sum(t["amount"] for t in y_trips)
-    lines = [
-        f"📅 *Yearly Report {year}*",
-        f"💰 Extra total (real trips): *{total:.2f} AED*",
-        "",
-        "📋 Details:",
-    ]
+    lines = [f"📅 *Yearly Report {year}*", f"💰 Extra total: *{total:.2f} AED*", "", "📋 Details:"]
     for t in sorted(y_trips, key=lambda x: x["id"]):
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         d_str = dt.strftime("%Y-%m-%d")
         lines.append(
-            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* "
-            f"(by {t.get('user_name','?')})"
+            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* (by {t.get('user_name','?')})"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -542,19 +458,6 @@ async def delete_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(f"✅ Trip {trip_id} deleted.")
 
 
-async def clear_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete ALL trips (real + test)."""
-    if not await ensure_authorized(update):
-        return
-
-    data = load_data()
-    count = len(data["trips"])
-    data["trips"] = []
-    save_data(data)
-
-    await update.message.reply_text(f"🧹 Cleared all trips. Removed {count} records.")
-
-
 async def filter_by_date_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_authorized(update):
         return
@@ -570,19 +473,17 @@ async def filter_by_date_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     data = load_data()
-    raw = filter_trips_by_day(data["trips"], d)
-    trips = [t for t in raw if is_real_trip(t)]
+    trips = filter_trips_by_day(data["trips"], d)
 
     if not trips:
-        await update.message.reply_text(f"No *real* trips on {d}.", parse_mode="Markdown")
+        await update.message.reply_text(f"No trips on {d}.")
         return
 
     total = sum(t["amount"] for t in trips)
-    lines = [f"📅 Trips on {d} (real only):", f"💰 Total: *{total:.2f} AED*", ""]
+    lines = [f"📅 Trips on {d}:", f"💰 Total: *{total:.2f} AED*", ""]
     for t in sorted(trips, key=lambda x: x["id"]):
         lines.append(
-            f"- ID {t['id']}: {t['destination']} — *{t['amount']:.2f} AED* "
-            f"(by {t.get('user_name','?')})"
+            f"- ID {t['id']}: {t['destination']} — *{t['amount']:.2f} AED* (by {t.get('user_name','?')})"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -598,21 +499,19 @@ async def destination_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     keyword = " ".join(context.args)
     data = load_data()
-    raw = filter_by_destination(data["trips"], keyword)
-    trips = [t for t in raw if is_real_trip(t)]
+    trips = filter_by_destination(data["trips"], keyword)
 
     if not trips:
-        await update.message.reply_text(f"No *real* trips matching '{keyword}'.", parse_mode="Markdown")
+        await update.message.reply_text(f"No trips matching '{keyword}'.")
         return
 
     total = sum(t["amount"] for t in trips)
-    lines = [f"📍 Trips matching '{keyword}' (real only):", f"💰 Total: *{total:.2f} AED*", ""]
+    lines = [f"📍 Trips matching '{keyword}':", f"💰 Total: *{total:.2f} AED*", ""]
     for t in sorted(trips, key=lambda x: x["id"]):
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         d_str = dt.strftime("%Y-%m-%d")
         lines.append(
-            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* "
-            f"(by {t.get('user_name','?')})"
+            f"- ID {t['id']}: {d_str} — {t['destination']} — *{t['amount']:.2f} AED* (by {t.get('user_name','?')})"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -631,19 +530,18 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     filename = "driver_trips_export.csv"
     with open(filename, "w", encoding="utf-8") as f:
-        f.write("id,date,amount,destination,user_id,user_name,is_test\n")
+        f.write("id,date,amount,destination,user_id,user_name\n")
         for t in sorted(trips, key=lambda x: x["id"]):
             f.write(
                 f"{t['id']},{t['date']},{t['amount']},"
                 f"\"{t['destination'].replace('\"','\"\"')}\","
-                f"{t.get('user_id','')},\"{(t.get('user_name') or '').replace('\"','\"\"')}\","
-                f"{1 if t.get('is_test', False) else 0}\n"
+                f"{t.get('user_id','')},\"{(t.get('user_name') or '').replace('\"','\"\"')}\"\n"
             )
 
     await update.message.reply_document(
         document=InputFile(filename),
         filename=filename,
-        caption="📄 All trips (real + test) exported as CSV.",
+        caption="📄 All trips (shared ledger) exported as CSV.",
     )
 
 
@@ -669,31 +567,6 @@ async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"✅ Marked {d_str} as no-school day.")
     else:
         await update.message.reply_text(f"ℹ️ {d_str} is already marked as no-school.")
-
-
-async def removeschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a date from the no-school list."""
-    if not await ensure_authorized(update):
-        return
-
-    data = load_data()
-
-    if context.args:
-        try:
-            d = parse_date_str(context.args[0])
-        except Exception:
-            await update.message.reply_text("Invalid date format. Use YYYY-MM-DD.")
-            return
-    else:
-        d = today_dubai()
-
-    d_str = d.strftime("%Y-%m-%d")
-    if d_str in data["no_school_dates"]:
-        data["no_school_dates"].remove(d_str)
-        save_data(data)
-        await update.message.reply_text(f"✅ {d_str} removed from no-school days.")
-    else:
-        await update.message.reply_text(f"ℹ️ {d_str} was not marked as no-school.")
 
 
 async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -737,158 +610,6 @@ async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-# --------- Test Mode Commands ---------
-
-async def test_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_authorized(update):
-        return
-
-    data = load_data()
-    data["test_mode"] = True
-    save_data(data)
-
-    await update.message.reply_text(
-        "🧪 *Test Mode is ON*\n"
-        "New `/trip` entries will be marked as TEST and *ignored* in reports.",
-        parse_mode="Markdown",
-    )
-
-
-async def test_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_authorized(update):
-        return
-
-    data = load_data()
-    data["test_mode"] = False
-    save_data(data)
-
-    await update.message.reply_text(
-        "✅ *Test Mode is OFF*\n"
-        "New `/trip` entries will be counted as REAL in reports.",
-        parse_mode="Markdown",
-    )
-
-
-async def toggle_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Toggle test_mode (for menu button)."""
-    if not await ensure_authorized(update):
-        return
-
-    data = load_data()
-    current = data.get("test_mode", False)
-    data["test_mode"] = not current
-    save_data(data)
-
-    if data["test_mode"]:
-        msg = (
-            "🧪 *Test Mode is now ON*\n"
-            "New trips will be TEST and ignored in totals."
-        )
-    else:
-        msg = (
-            "✅ *Test Mode is now OFF*\n"
-            "New trips will be REAL and counted in all reports."
-        )
-
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-# --------- Buttons UI (/menu) ---------
-
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_authorized(update):
-        return
-
-    keyboard = [
-        [KeyboardButton(BTN_ADD_TRIP), KeyboardButton(BTN_LIST)],
-        [KeyboardButton(BTN_REPORT), BTN_MONTH, BTN_YEAR],
-        [KeyboardButton(BTN_NOSCHOOL), KeyboardButton(BTN_REMOVESCHOOL)],
-        [KeyboardButton(BTN_HOLIDAY), KeyboardButton(BTN_EXPORT)],
-        [KeyboardButton(BTN_TOGGLE_TEST), KeyboardButton(BTN_CLEAR_TRIPS)],
-    ]
-
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    await update.message.reply_text(
-        "📱 Menu — choose an action:",
-        reply_markup=reply_markup,
-    )
-
-
-async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle presses on the ReplyKeyboard buttons."""
-    if not await ensure_authorized(update):
-        return
-
-    text = (update.message.text or "").strip()
-
-    # Only react to our known buttons; ignore normal text
-    if text == BTN_ADD_TRIP:
-        await update.message.reply_text(
-            "To add a trip, send:\n`/trip <amount> <destination>`\n"
-            "Example: `/trip 25 Dubai Mall`",
-            parse_mode="Markdown",
-        )
-        return
-
-    if text == BTN_LIST:
-        context.args = []
-        await list_trips(update, context)
-        return
-
-    if text == BTN_REPORT:
-        context.args = []
-        await report(update, context)
-        return
-
-    if text == BTN_MONTH:
-        # current month by default
-        context.args = []
-        await month_report(update, context)
-        return
-
-    if text == BTN_YEAR:
-        # current year by default
-        context.args = []
-        await year_report(update, context)
-        return
-
-    if text == BTN_NOSCHOOL:
-        context.args = []
-        await noschool_cmd(update, context)
-        return
-
-    if text == BTN_REMOVESCHOOL:
-        context.args = []
-        await removeschool_cmd(update, context)
-        return
-
-    if text == BTN_HOLIDAY:
-        await update.message.reply_text(
-            "To set a holiday range, send:\n"
-            "`/holiday YYYY-MM-DD YYYY-MM-DD`\n"
-            "Example: `/holiday 2025-12-02 2025-12-05`",
-            parse_mode="Markdown",
-        )
-        return
-
-    if text == BTN_EXPORT:
-        context.args = []
-        await export_cmd(update, context)
-        return
-
-    if text == BTN_TOGGLE_TEST:
-        await toggle_test_cmd(update, context)
-        return
-
-    if text == BTN_CLEAR_TRIPS:
-        await clear_trips_cmd(update, context)
-        return
-
-    # Any other text (not a button we know) — ignore
-    return
-
-
 # --------- Weekly Job (Friday 10:00) ---------
 
 async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -901,6 +622,7 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(chat_id, text, parse_mode="Markdown")
         except Exception:
+            # ignore send errors (chat left, blocked, etc.)
             continue
 
 
@@ -913,9 +635,8 @@ def main() -> None:
 
     application = Application.builder().token(token).build()
 
-    # Commands
+    # Command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu", menu_cmd))
     application.add_handler(CommandHandler("setbase", set_base))
     application.add_handler(CommandHandler("trip", add_trip))
     application.add_handler(CommandHandler("list", list_trips))
@@ -923,23 +644,11 @@ def main() -> None:
     application.add_handler(CommandHandler("month", month_report))
     application.add_handler(CommandHandler("year", year_report))
     application.add_handler(CommandHandler("delete", delete_trip))
-    application.add_handler(CommandHandler("cleartrips", clear_trips_cmd))
     application.add_handler(CommandHandler("filter", filter_by_date_cmd))
     application.add_handler(CommandHandler("destination", destination_cmd))
     application.add_handler(CommandHandler("export", export_cmd))
     application.add_handler(CommandHandler("noschool", noschool_cmd))
-    application.add_handler(CommandHandler("removeschool", removeschool_cmd))
     application.add_handler(CommandHandler("holiday", holiday_cmd))
-    application.add_handler(CommandHandler("test_on", test_on_cmd))
-    application.add_handler(CommandHandler("test_off", test_off_cmd))
-
-    # Menu buttons handler (must be after command handlers)
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & (~filters.COMMAND),
-            menu_button_handler,
-        )
-    )
 
     # JobQueue (requires python-telegram-bot[job-queue])
     if application.job_queue is None:

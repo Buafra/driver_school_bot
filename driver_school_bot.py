@@ -255,9 +255,8 @@ def build_weekly_report_text(data: Dict[str, Any],
 # --------- Commands ---------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_authorized(update):
-        return
-
+    """Always reply to /start and show the user's Telegram ID + auth status."""
+    user = update.effective_user
     chat_id = update.effective_chat.id
     data = load_data()
 
@@ -266,9 +265,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data["subscribers"].append(chat_id)
         save_data(data)
 
+    user_id = user.id if user else None
+    is_auth = user_id in ALLOWED_USERS
+
     msg = (
         "👋 *DriverSchoolBot — Shared Ledger*\n\n"
         "All trips from you and Abdulla go into *one* account.\n\n"
+        f"👤 Your Telegram ID: `{user_id}`\n"
+        f"🔐 Authorized: *{'YES ✅' if is_auth else 'NO ❌'}*\n\n"
         "Main commands:\n"
         "• `/menu` — show buttons menu\n"
         "• `/trip <amount> <destination>` – add extra trip\n"
@@ -293,7 +297,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔔 Auto weekly report every *Friday 10:00 (Dubai)*."
     )
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 
 async def set_base(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

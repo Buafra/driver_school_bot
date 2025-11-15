@@ -427,6 +427,54 @@ async def notify_admins_for_trip(
             continue
 
 
+
+
+async def holiday_reminder_start_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Job: remind drivers one day before the holiday starts.
+    """
+    job = context.job
+    data_dict = getattr(job, "data", {}) or {}
+    start_str = data_dict.get("start")
+    end_str = data_dict.get("end")
+
+    data = load_data()
+
+    if start_str and end_str:
+        text = (
+            f"⏰ Reminder: Holiday starts tomorrow ({start_str}).\n"
+            f"🏫 No school from {start_str} to {end_str}."
+        )
+    elif start_str:
+        text = f"⏰ Reminder: Holiday starts tomorrow ({start_str})."
+    else:
+        text = "⏰ Reminder: Holiday starts tomorrow."
+
+    await notify_drivers(context, data, text)
+
+
+async def holiday_reminder_end_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Job: remind drivers one day before the holiday ends (to resume work).
+    """
+    job = context.job
+    data_dict = getattr(job, "data", {}) or {}
+    start_str = data_dict.get("start")
+    end_str = data_dict.get("end")
+
+    data = load_data()
+
+    if end_str:
+        text = (
+            f"🔔 Reminder: Holiday will end tomorrow ({end_str}).\n"
+            "🚗 Please get ready to resume school drop-off after the holiday."
+        )
+    else:
+        text = "🔔 Reminder: Holiday will end tomorrow. Please get ready to resume school drop-off."
+
+    await notify_drivers(context, data, text)
+
+
 # ---------- /start ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1141,6 +1189,42 @@ async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     text = f"🎉 Holiday announced from {start_d} to {end_d}.\n🏫 No school on these days."
     await notify_drivers(context, data, text)
+
+    # Extra driver notifications for holidays:
+    # 1) When we set the holiday (above)
+    # 2) One day before the holiday starts
+    # 3) One day before the holiday ends (reminder to resume work)
+    try:
+        app = context.application
+        job_queue = app.job_queue if app else None
+    except Exception:
+        job_queue = None
+
+    if job_queue:
+        now_dt = datetime.now(DUBAI_TZ)
+
+        # 1 day before holiday start
+        start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=DUBAI_TZ)
+        remind_start_dt = start_dt - timedelta(days=1)
+        if remind_start_dt > now_dt:
+            job_queue.run_once(
+                holiday_reminder_start_job,
+                when=remind_start_dt,
+                name=f"holiday_start_{start_d.isoformat()}_{end_d.isoformat()}",
+                data={"start": start_d.isoformat(), "end": end_d.isoformat()},
+            )
+
+        # 1 day before holiday end
+        end_dt = datetime.combine(end_d, datetime.min.time(), tzinfo=DUBAI_TZ)
+        remind_end_dt = end_dt - timedelta(days=1)
+        if remind_end_dt > now_dt:
+            job_queue.run_once(
+                holiday_reminder_end_job,
+                when=remind_end_dt,
+                name=f"holiday_end_{start_d.isoformat()}_{end_d.isoformat()}",
+                data={"start": start_d.isoformat(), "end": end_d.isoformat()},
+            )
+
 
 
 # ---------- Test mode ----------

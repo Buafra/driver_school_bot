@@ -126,6 +126,10 @@ def load_data() -> Dict[str, Any]:
         # drivers keyed by telegram_id string
         # value: {"id": int, "name": str, "active": bool, "is_primary": bool}
         data["drivers"] = {}
+    for d in data["drivers"].values():
+        if "start_date" not in d:
+            d["start_date"] = None
+
 
     if "admin_chats" not in data or not isinstance(data["admin_chats"], list):
         data["admin_chats"] = []  # chat_ids of admins who used /start
@@ -396,6 +400,15 @@ def build_driver_weekly_report(
     if not clamped:
         return None
     start_d, end_d = clamped
+    drv_start_str = driver.get("start_date")
+    if drv_start_str:
+        try:
+            drv_start = parse_date_str(drv_start_str)
+            if drv_start > start_d:
+                start_d = drv_start
+        except Exception:
+            pass
+
 
     base_weekly = data["base_weekly"]
     no_school_dates = data["no_school_dates"]
@@ -506,6 +519,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• /setbase <amount> – change weekly base (default 725)\n"
             "• /setweekstart <YYYY-MM-DD> – when driver calculations start\n"
             "• /getweekstart – show current start date\n"
+            "• /setdriverstart <driver_id> <YYYY-MM-DD> – start date for this driver\n"
+            "• /removedriverstart <driver_id> – clear driver start date\n"
             "• /trip <amount> <destination> – add trip for primary driver\n"
             "• /tripfor <driver_id> <amount> <destination> – for specific driver\n"
             "• /report – weekly report\n"
@@ -592,6 +607,63 @@ async def get_week_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("No start date set yet. Use /setweekstart YYYY-MM-DD.")
 
 
+
+
+async def set_driver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /setdriverstart <driver_id> <YYYY-MM-DD>")
+        return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver ID must be a number.")
+        return
+    try:
+        d = parse_date_str(context.args[1])
+    except Exception:
+        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
+        return
+    data = load_data()
+    drivers = data.get("drivers", {})
+    key = str(driver_id)
+    drv = drivers.get(key)
+    if not drv:
+        await update.message.reply_text(f"Driver {driver_id} not found. Use /adddriver first.")
+        return
+    drv["start_date"] = format_date(d)
+    save_data(data)
+    name = drv.get("name") or str(driver_id)
+    await update.message.reply_text(f"✅ Start date for driver {name} set to {format_date(d)}.")
+
+
+async def remove_driver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removedriverstart <driver_id>")
+        return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver ID must be a number.")
+        return
+    data = load_data()
+    drivers = data.get("drivers", {})
+    key = str(driver_id)
+    drv = drivers.get(key)
+    if not drv:
+        await update.message.reply_text(f"Driver {driver_id} not found.")
+        return
+    if not drv.get("start_date"):
+        await update.message.reply_text("This driver has no start date set.")
+        return
+    drv["start_date"] = None
+    save_data(data)
+    name = drv.get("name") or str(driver_id)
+    await update.message.reply_text(f"🗑️ Start date removed for driver {name}. Counting will use the global start date (if any).")
+
 async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update):
         return
@@ -616,6 +688,7 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "name": name,
         "active": True,
         "is_primary": first_driver,  # first added becomes primary by default
+        "start_date": None,
     }
     save_data(data)
 
@@ -926,13 +999,16 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     with open(filename, "w", encoding="utf-8") as f:
         f.write("id,date,amount,destination,user_id,user_name,driver_id,driver_name,is_test\n")
         for t in sorted(trips, key=lambda x: x["id"]):
+            dest = str(t.get("destination", "")).replace("\"", "\"\"")
+            user_name = (t.get("user_name") or "").replace("\"", "\"\"")
+            driver_name = (t.get("driver_name") or "").replace("\"", "\"\"")
             f.write(
                 f"{t['id']},{t['date']},{t['amount']},"
-                f"\"{t['destination'].replace('\"','\"\"')}\","
+                f"\"{dest}\","
                 f"{t.get('user_id','')},"
-                f"\"{(t.get('user_name') or '').replace('\"','\"\"')}\","
+                f"\"{user_name}\","
                 f"{t.get('driver_id','')},"
-                f"\"{(t.get('driver_name') or '').replace('\"','\"\"')}\","
+                f"\"{driver_name}\","
                 f"{1 if t.get('is_test', False) else 0}\n"
             )
 
@@ -1458,6 +1534,8 @@ def main() -> None:
     application.add_handler(CommandHandler("setbase", set_base))
     application.add_handler(CommandHandler("setweekstart", set_week_start))
     application.add_handler(CommandHandler("getweekstart", get_week_start))
+    application.add_handler(CommandHandler("setdriverstart", set_driver_start))
+    application.add_handler(CommandHandler("removedriverstart", remove_driver_start))
     application.add_handler(CommandHandler("adddriver", adddriver_cmd))
     application.add_handler(CommandHandler("removedriver", removedriver_cmd))
     application.add_handler(CommandHandler("setprimarydriver", setprimarydriver_cmd))

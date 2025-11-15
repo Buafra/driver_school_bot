@@ -1,1370 +1,1523 @@
-# -*- coding: utf-8 -*-
-"""
-AECyberTV Telegram Sales Bot — Bilingual + Renew + Free Trial + Support + Offers
-python-telegram-bot==21.4
-"""
+# driver_school_bot.py
+# DriverSchoolBot — multi-driver shared ledger with school base, holidays, and notifications
+#
+# Features:
+# - Admins: you (Faisal) + Abdulla by Telegram ID
+# - Multiple drivers (add/remove/set primary)
+# - Start date for calculations (/setweekstart)
+# - Weekly / monthly / yearly reports with school base & extra trips
+# - No-school days & holiday ranges
+# - Holiday notifications to drivers (3 per holiday):
+#     1) When holiday is set
+#     2) One day before holiday starts
+#     3) One day before holiday ends (resume next day)
+# - Notifications:
+#     - To admins when any REAL trip is added
+#     - To driver when trip is added for him
+#     - To drivers on no-school days
+# - Quick trip (e.g. "70 Dubai Mall") for primary driver
+# - Admin menu + No-School submenu + Drivers submenu
+# - Driver menu (buttons only, no typing)
 
 import os
-import re
 import json
-import logging
-import sys
+from datetime import datetime, date, time, timedelta
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, Contact, InputMediaPhoto,
-    BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+    Update,
+    InputFile,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes,
-    MessageHandler, CallbackQueryHandler, filters
+    Application,
+    CommandHandler,
+ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# ------------------------- CONFIG -------------------------
-def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except Exception:
-        raise ValueError(f"Environment variable {name} must be an integer, got: {v!r}")
+# ---------- Constants ----------
 
-BOT_TOKEN     = os.getenv("BOT_TOKEN")  # required
-ADMIN_CHAT_ID = env_int("ADMIN_CHAT_ID")  # optional
-WEBHOOK_URL   = os.getenv("WEBHOOK_URL")   # optional
-
-if not BOT_TOKEN:
-    logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
-    logging.error("Missing BOT_TOKEN env var. Set BOT_TOKEN before running.")
-    sys.exit(1)
-
-# ------------------------- TIME/UTILS -------------------------
+DATA_FILE = Path("driver_school_data.json")
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+DEFAULT_BASE_WEEKLY = 725.0  # AED
+SCHOOL_DAYS_PER_WEEK = 5
 
-def _now_uae() -> datetime:
+# Admins (family) — Telegram user IDs
+ALLOWED_ADMINS = [
+    7698278415,  # Faisal
+    5034920293,  # Abdulla
+]
+
+# Buttons — Admin main menu
+BTN_ADD_TRIP = "➕ Add Trip"
+BTN_LIST_TRIPS = "📋 List Trips"
+BTN_WEEKLY_REPORT = "📊 Weekly Report"
+BTN_MONTH_REPORT = "📅 Month"
+BTN_YEAR_REPORT = "📆 Year"
+BTN_NOSCHOOL_MENU = "🏫 No School"
+BTN_EXPORT_CSV = "📄 Export CSV"
+BTN_CLEAR_TRIPS = "🧹 Clear All Trips"
+BTN_TOGGLE_TEST = "🧪 Test Mode"
+BTN_DRIVERS_MENU = "🚕 Drivers"
+
+# Buttons — No-school submenu
+BTN_NOSCHOOL_TODAY = "🏫 No School Today"
+BTN_NOSCHOOL_TOMORROW = "🏫 No School Tomorrow"
+BTN_NOSCHOOL_PICKDATE = "📅 No School (Pick Date)"
+BTN_BACK_MAIN = "⬅ Back"
+
+# Buttons — Drivers submenu
+BTN_DRIVERS_LIST = "🚕 List Drivers"
+BTN_DRIVERS_ADD = "➕ Add Driver"
+BTN_DRIVERS_REMOVE = "🗑 Remove Driver"
+BTN_DRIVERS_SET_PRIMARY = "⭐ Set Primary Driver"
+
+# Buttons — Driver menu (for drivers themselves)
+BTN_DRIVER_MY_WEEK = "📦 My Week"
+BTN_DRIVER_MY_REPORT = "🧾 My Weekly Report"
+
+
+# ---------- Data helpers ----------
+
+def load_data() -> Dict[str, Any]:
+    if DATA_FILE.exists():
+        try:
+            with DATA_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    else:
+        data = {}
+
+    if not isinstance(data, dict):
+        data = {}
+
+    if "base_weekly" not in data:
+        data["base_weekly"] = DEFAULT_BASE_WEEKLY
+
+    if "week_start_date" not in data:
+        # string "YYYY-MM-DD" or None — where to start counting school & trips
+        data["week_start_date"] = None
+
+    if "trips" not in data or not isinstance(data["trips"], list):
+        data["trips"] = []  # list of trip dicts
+
+    if "next_trip_id" not in data:
+        data["next_trip_id"] = 1
+
+    if "no_school_dates" not in data or not isinstance(data["no_school_dates"], list):
+        data["no_school_dates"] = []  # list of "YYYY-MM-DD"
+
+    if "holiday_ranges" not in data or not isinstance(data["holiday_ranges"], list):
+        # each: {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD",
+        #        "notified_on_create": bool,
+        #        "notified_before_start": bool,
+        #        "notified_before_end": bool}
+        data["holiday_ranges"] = []
+
+    if "drivers" not in data or not isinstance(data["drivers"], dict):
+        # drivers keyed by telegram_id string
+        # value: {"id": int, "name": str, "active": bool, "is_primary": bool}
+        data["drivers"] = {}
+
+    if "admin_chats" not in data or not isinstance(data["admin_chats"], list):
+        data["admin_chats"] = []  # chat_ids of admins who used /start
+
+    if "test_mode" not in data:
+        data["test_mode"] = False
+
+    if "pending_preview_monday" not in data:
+        data["pending_preview_monday"] = None  # for Sunday preview -> /confirmdrivers
+
+    if "awaiting_noschool_date" not in data:
+        data["awaiting_noschool_date"] = []  # list of admin chat_ids waiting for date input
+
+    return data
+
+
+def save_data(data: Dict[str, Any]) -> None:
+    try:
+        with DATA_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def today_dubai() -> date:
+    return datetime.now(DUBAI_TZ).date()
+
+
+def now_dubai() -> datetime:
     return datetime.now(DUBAI_TZ)
 
-def _parse_iso(ts: str) -> datetime:
-    ts = ts.strip()
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    return datetime.fromisoformat(ts)
 
-def _iso_utc(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-def dubai_range_to_utc_iso(start_local: datetime, end_local: datetime) -> tuple[str, str]:
-    if start_local.tzinfo is None:
-        start_local = start_local.replace(tzinfo=DUBAI_TZ)
-    if end_local.tzinfo is None:
-        end_local = end_local.replace(tzinfo=DUBAI_TZ)
-    return _iso_utc(start_local), _iso_utc(end_local)
-
-# ------------------------- FILE IO -------------------------
-HISTORY_FILE = Path("customers.jsonl")
-TRIALS_FILE  = Path("trials.jsonl")
-SUPPORT_FILE = Path("support.jsonl")
-
-def save_jsonl(path: Path, obj: dict) -> int:
-    """Append obj to JSONL with an auto ticket id (line number)."""
-    path.touch(exist_ok=True)
-    tid = 0
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for tid, _ in enumerate(f, start=1):
-                pass
-    except Exception:
-        tid = 0
-    tid = (tid or 0) + 1
-    rec = {"id": tid, **obj}
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    return tid
-
-def iter_jsonl(path: Path):
-    if not path.exists():
-        return []
-    items = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append(json.loads(line))
-            except Exception:
-                continue
-    return items
-
-# ------------------------- PACKAGES -------------------------
-PACKAGES: Dict[str, Dict[str, Any]] = {
-    "AECyberTV Kids": {
-        "code": "kids",
-        "price_aed": 70,
-        "trial_hours": 8,
-        "details_en": "\n• Kids-safe channels\n• Cartoons & Educational shows\n• Works on 1 device\n",
-        "details_ar": "\n• قنوات للأطفال\n• كرتون وبرامج تعليمية\n• يعمل على جهاز واحد\n",
-        "payment_url": "https://buy.stripe.com/3cIbJ29I94yA92g2AV5kk04",
-    },
-    "AECyberTV Casual": {
-        "code": "casual",
-        "price_aed": 75,
-        "trial_hours": 24,
-        "details_en": "\n• 10,000+ Live Channels\n• 70,000+ Movies (VOD)\n• 12,000+ Series\n• Works on 1 device\n",
-        "details_ar": "\n• أكثر من 10,000 قناة مباشرة\n• 70,000+ فيلم (VOD)\n• 12,000+ مسلسل\n• يعمل على جهاز واحد\n",
-        "payment_url": "https://buy.stripe.com/6oU6oIf2t8OQa6kejD5kk03",
-    },
-    "AECyberTV Executive": {
-        "code": "executive",
-        "price_aed": 200,
-        "trial_hours": 10,
-        "details_en": "\n• 16,000+ Live Channels\n• 24,000+ Movies (VOD)\n• 14,000+ Series\n• 2 devices • SD/HD/FHD/4K\n",
-        "details_ar": "\n• 16,000+ قناة مباشرة\n• 24,000+ فيلم (VOD)\n• 14,000+ مسلسل\n• جهازان • SD/HD/FHD/4K\n",
-        "payment_url": "https://buy.stripe.com/8x23cw07zghi4M0ejD5kk05",
-    },
-    "AECyberTV Premium": {
-        "code": "premium",
-        "price_aed": 250,
-        "trial_hours": 24,
-        "details_en": "\n• Full combo package\n• 65,000+ Live Channels\n• 180,000+ Movies (VOD)\n• 10,000+ Series\n• Priority support\n",
-        "details_ar": "\n• باقة كاملة شاملة\n• 65,000+ قناة مباشرة\n• 180,000+ فيلم (VOD)\n• 10,000+ مسلسل\n• دعم أولوية\n",
-        "payment_url": "https://buy.stripe.com/eVq00k7A15CE92gdfz5kk01",
-    },
-}
-
-# ------------------------- OFFER PAYMENT LINKS -------------------------
-# National Day (Dec 1–7, 2025)
-CTA_NATIONAL_DAY: Dict[str, str] = {
-    "Casual":   "https://buy.stripe.com/aFaaEYf2t9SU0vK7Vf5kk09",
-    "Executive":"https://buy.stripe.com/28EaEY07zghi5Q45N75kk0c",
-    "Kids":     "https://buy.stripe.com/9B6fZi4nP0ik1zO0sN5kk0b",
-    "Premium":  "https://buy.stripe.com/28EbJ26vXc12emA3EZ5kk0a",
-}
-# Christmas & New Year and other offers
-CTA_DEFAULT: Dict[str, str] = {
-    "Casual":   "https://buy.stripe.com/cNi8wQ3jL1moa6k1wR5kk0g",
-    "Premium":  "https://buy.stripe.com/aFa00k7A1e9aces2AV5kk0f",
-    "Kids":     "https://buy.stripe.com/cNi3cw5rTc12baoejD5kk0e",
-    "Executive":"https://buy.stripe.com/8x200kbQh7KM3HW1wR5kk0d",
-}
-
-# ------------------------- OFFERS (NEW) -------------------------
-def build_embedded_offers() -> List[Dict[str, Any]]:
-    """AECybertv official offers schedule (2025–2026)."""
-    note_en = "ℹ️ Note: offers may change at any time."
-    note_ar = "ℹ️ ملاحظة: العروض قابلة للتغيير في أي وقت."
-
-    body_en_common = (
-        "🎬 Enjoy thousands of Live Channels, Movies, and Series!\n"
-        "Available for all AECyberTV packages."
-    )
-    body_ar_common = (
-        "🎬 استمتع بآلاف القنوات والأفلام والمسلسلات!\n"
-        "العرض متوفر لجميع باقات AECyberTV."
-    )
-
-    def _range(y1, m1, d1, y2, m2, d2):
-        return dubai_range_to_utc_iso(
-            datetime(y1, m1, d1, 0, 0, 0, tzinfo=DUBAI_TZ),
-            datetime(y2, m2, d2, 23, 59, 59, tzinfo=DUBAI_TZ),
-        )
-
-    offers: List[Dict[str, Any]] = []
-
-    # Current Offer — single November offer (Nov 7 → Nov 20, 2025)
-    s, e = _range(2025, 11, 7, 2025, 11, 20)
-    offers.append({
-        "id": "current_offer_nov2025",
-        "title_en": "🔥 Current Offer — Available Now",
-        "title_ar": "🔥 العرض الحالي — متاح الآن",
-        "body_en": (
-            f"{body_en_common}\n\n"
-            "📅 7–20 Nov 2025\n\n"
-            "💰 Prices:\n"
-            "• Kids – 50 AED/year\n"
-            "• Casual – 50 AED/year\n"
-            "• Executive – 150 AED/year\n"
-            "• Premium – 200 AED/year\n\n"
-            f"{note_en}"
-        ),
-        "body_ar": (
-            f"{body_ar_common}\n\n"
-            "📅 ٧–٢٠ نوفمبر ٢٠٢٥\n\n"
-            "💰 الأسعار:\n"
-            "• أطفال – ٥٠ درهم/سنة\n"
-            "• عادي – ٥٠ درهم/سنة\n"
-            "• تنفيذي – ١٥٠ درهم/سنة\n"
-            "• بريميوم – ٢٠٠ درهم/سنة\n\n"
-            f"{note_ar}"
-        ),
-        "cta_urls": CTA_DEFAULT,
-        "start_at": s, "end_at": e, "priority": 150
-    })
-
-    # UAE National Day — Dec 1–7, 2025
-    s, e = _range(2025, 12, 1, 2025, 12, 7)
-    offers.append({
-        "id": "uae_national_day_2025",
-        "title_en": "🇦🇪 UAE National Day Offer",
-        "title_ar": "🇦🇪 عرض اليوم الوطني",
-        "body_en": f"{body_en_common}\n\n📅 1–7 Dec 2025\n\n{note_en}",
-        "body_ar": f"{body_ar_common}\n\n📅 من 1 إلى 7 ديسمبر 2025\n\n{note_ar}",
-        "cta_urls": CTA_NATIONAL_DAY,
-        "start_at": s, "end_at": e, "priority": 200
-    })
-
-    # Christmas & New Year — Dec 24, 2025 – Jan 5, 2026
-    s, e = _range(2025, 12, 24, 2026, 1, 5)
-    offers.append({
-        "id": "xmas_newyear_2025_2026",
-        "title_en": "🎄 Christmas & New Year Offer",
-        "title_ar": "🎄 عرض الكريسماس ورأس السنة",
-        "body_en": f"{body_en_common}\n\n📅 24 Dec 2025 – 5 Jan 2026\n\n{note_en}",
-        "body_ar": f"{body_ar_common}\n\n📅 ٢٤ ديسمبر ٢٠٢٥ – ٥ يناير ٢٠٢٦\n\n{note_ar}",
-        "cta_urls": CTA_DEFAULT,
-        "start_at": s, "end_at": e, "priority": 100
-    })
-
-    return offers
-
-def active_offers(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    if now is None:
-        now = _utcnow()  # UTC
-    acts: List[Dict[str, Any]] = []
-    for o in OFFERS_ALL:
-        try:
-            if _parse_iso(o["start_at"]) <= now <= _parse_iso(o["end_at"]):
-                acts.append(o)
-        except Exception:
-            continue
-    acts.sort(key=lambda x: (-(int(x.get("priority", 0))), x.get("start_at", "")))
-    return acts
-
-def upcoming_offers(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    if now is None:
-        now = _utcnow()  # UTC
-    ups: List[Dict[str, Any]] = []
-    for o in OFFERS_ALL:
-        try:
-            if now < _parse_iso(o["start_at"]):
-                ups.append(o)
-        except Exception:
-            continue
-    ups.sort(key=lambda x: x.get("start_at", ""))
-    return ups
-
-# ------------------------- STATE -------------------------
-USER_STATE: Dict[int, Dict[str, Any]] = {}
-PHONE_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}$")
-
-def normalize_phone(s: str) -> str:
-    s = s.strip()
-    if s.startswith("00"):
-        s = "+" + s[2:]
-    return re.sub(r"[^\d+]", "", s)
-
-def set_state(chat_id: int, **kv):
-    st = USER_STATE.setdefault(chat_id, {})
-    st.update(kv)
-
-def get_state(chat_id: int) -> Dict[str, Any]:
-    return USER_STATE.get(chat_id, {})
-
-def save_customer(chat_id: int, user, package: Optional[str], phone: Optional[str], extra: Optional[dict]=None) -> None:
-    rec = {
-        "chat_id": chat_id,
-        "user_id": user.id,
-        "username": user.username,
-        "name": user.full_name,
-        "package": package,
-        "phone": phone,
-        "ts": _now_uae().isoformat(timespec="seconds"),
-    }
-    if extra:
-        rec.update(extra)
-    try:
-        with HISTORY_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logging.error("Failed to write customers.jsonl: %s", e)
-
-# ------------------------- I18N -------------------------
-BRAND = "AECyberTV"
-I18N = {
-    "pick_lang": {"ar": "اختر اللغة:", "en": "Choose your language:"},
-    "lang_ar": {"ar": "العربية", "en": "Arabic"},
-    "lang_en": {"ar": "English", "en": "English"},
-    "welcome": {
-        "ar": f"مرحباً بك في {BRAND}!\n\nكيف نقدر نساعدك اليوم؟",
-        "en": f"Welcome to {BRAND}!\n\nHow can we help you today?",
-    },
-
-    # ===== Compact Players & Compatibility (Summary) =====
-    "more_info_title": {
-        "ar": "📺 تطبيقات AECyberTV | AECyberTV Players",
-        "en": "📺 AECyberTV Players | تطبيقات AECyberTV",
-    },
-    "more_info_body_compact": {
-        "ar": (
-            "📺 تطبيقات AECyberTV (رقم الخادم: 7765)\n\n"
-            "🍏 iPlay\n"
-            "• يعمل على أجهزة آيفون / آيباد / ماك (لاحقًا Apple TV)\n"
-            "• الأنسب لمستخدمي أجهزة آبل\n\n"
-            "🤖 S Player\n"
-            "• يعمل على أجهزة أندرويد / التلفزيونات الذكية / Firestick\n"
-            "• بعد التثبيت اضغط على شعار AECyberTV للاتصال\n\n"
-            "💠 000 Player\n"
-            "• يعمل على أجهزة iOS / أندرويد / التلفزيونات الذكية / الويب\n"
-            "• سريع وبسيط على جميع الأجهزة\n\n"
-            "ℹ️ روابط التحميل متوفرة في قسم «🔗 روابط التحميل»"
-        ),
-        "en": (
-            "📺 AECyberTV Players (Server: 7765)\n\n"
-            "🍏 iPlay\n"
-            "• Works on iPhone / iPad / Mac (Apple TV later)\n"
-            "• Best choice for Apple users\n\n"
-            "🤖 S Player\n"
-            "• Works on Android / Smart TVs / Firestick\n"
-            "• Tap the AECyberTV logo after installation to connect\n\n"
-            "💠 000 Player\n"
-            "• Works on iOS / Android / Smart TVs / Web\n"
-            "• Fast and simple across all devices\n\n"
-            "ℹ️ Download links available under “🔗 Download Links”"
-        ),
-    },
-
-    # ===== Download Links menu + per-player pages =====
-    "btn_players_links": {"ar": "🔗 روابط التحميل", "en": "🔗 Download Links"},
-    "players_links_title": {
-        "ar": "🔗 روابط التحميل | Download Links\nاختر التطبيق لرؤية الوصف والروابط:",
-        "en": "🔗 Download Links | روابط التحميل\nChoose a player to view description & links:",
-    },
-    "btn_player_iplay": {"ar": "🍏 iPlay", "en": "🍏 iPlay"},
-    "btn_player_splayer": {"ar": "🤖 S Player", "en": "🤖 S Player"},
-    "btn_player_000": {"ar": "💠 000 Player", "en": "💠 000 Player"},
-
-    # iPlay page
-    "player_iplay_body": {
-        "ar": (
-            "🍏 iPlay — يعمل على آيفون / آيباد / ماك (لاحقًا Apple TV)\n"
-            "استخدم نفس بيانات AECyberTV. مثالي لمستخدمي آبل.\n\n"
-            "App Store\n"
-            "https://apps.apple.com/us/app/iplay-hub/id6751518936"
-        ),
-        "en": (
-            "🍏 iPlay — iPhone / iPad / Mac (Apple TV soon)\n"
-            "Use your AECyberTV credentials. Great for Apple users.\n\n"
-            "App Store\n"
-            "https://apps.apple.com/us/app/iplay-hub/id6751518936"
-        ),
-    },
-
-    # S Player page
-    "player_splayer_body": {
-        "ar": (
-            "🤖 S Player — يعمل على أندرويد / التلفزيونات الذكية / Firestick\n"
-            "بعد التثبيت اضغط شعار AECyberTV للاتصال.\n\n"
-            "Google Play\n"
-            "https://play.google.com/store/apps/details?id=com.splayer.iptv\n\n"
-            "Downloader (Firestick)\n"
-            "http://aftv.news/5653918"
-        ),
-        "en": (
-            "🤖 S Player — Android / TV / Firestick\n"
-            "Click the AECyberTV logo inside the app to connect.\n\n"
-            "Google Play\n"
-            "https://play.google.com/store/apps/details?id=com.splayer.iptv\n\n"
-            "Downloader (Firestick)\n"
-            "http://aftv.news/5653918"
-        ),
-    },
-
-    # 000 Player page
-    "player_000_body": {
-        "ar": (
-            "💠 000 Player — يعمل على iOS / أندرويد / التلفزيونات الذكية / الويب\n"
-            "سريع وبسيط على كل الأجهزة. Fast & simple on all devices.\n\n"
-            "iOS\n"
-            "https://apps.apple.com/us/app/000-player/id1665441224\n\n"
-            "Android / Smart TV\n"
-            "https://000player.com/download\n\n"
-            "Downloader (Firestick)\n"
-            "http://aftv.news/6913771\n\n"
-            "Web\n"
-            "https://my.splayer.in"
-        ),
-        "en": (
-            "💠 000 Player — iOS / Android / TV / Web\n"
-            "Fast & simple on all devices. سريع وبسيط على كل الأجهزة.\n\n"
-            "iOS\n"
-            "https://apps.apple.com/us/app/000-player/id1665441224\n\n"
-            "Android / Smart TV\n"
-            "https://000player.com/download\n\n"
-            "Downloader (Firestick)\n"
-            "http://aftv.news/6913771\n\n"
-            "Web\n"
-            "https://my.splayer.in"
-        ),
-    },
-
-    # Common UI
-    "btn_more_info": {"ar": "📋 معلومات", "en": "📋 More Info"},
-    "btn_subscribe": {"ar": "💳 اشتراك", "en": "💳 Subscribe"},
-    "btn_renew": {"ar": "♻️ تجديد", "en": "♻️ Renew"},
-    "btn_trial": {"ar": "🧪 تجربة مجانية", "en": "🧪 Free Trial"},
-    "btn_support": {"ar": "🛟 دعم فني", "en": "🛟 Support"},
-    "btn_offers": {"ar": "🎁 العروض", "en": "🎁 Offers"},
-    "btn_back": {"ar": "⬅️ رجوع", "en": "⬅️ Back"},
-    "subscribe_pick": {"ar": "اختر الباقة:", "en": "Please choose a package:"},
-    "terms": {
-        "ar": (
-            "✅ الشروط والملاحظات\n\n"
-            "• التفعيل بعد تأكيد الدفع.\n"
-            "• حساب واحد لكل جهاز ما لم تذكر الباقة غير ذلك.\n"
-            "• الاستخدام على عدة أجهزة قد يسبب تقطيع أو إيقاف الخدمة.\n"
-            "• لا توجد استرجاعات بعد التفعيل.\n\n"
-            "هل توافق على المتابعة؟"
-        ),
-        "en": (
-            "✅ Terms & Notes\n\n"
-            "• Activation after payment confirmation.\n"
-            "• One account per device unless package allows more.\n"
-            "• Using multiple devices may cause buffering or stop service.\n"
-            "• No refunds after activation.\n\n"
-            "Do you agree to proceed?"
-        ),
-    },
-    "btn_agree": {"ar": "✅ أوافق", "en": "✅ I Agree"},
-    "payment_instructions": {
-        "ar": "💳 الدفع\n\nاضغط (ادفع الآن) لإتمام الدفع. ثم ارجع واضغط (دفعت).",
-        "en": "💳 Payment\n\nTap (Pay Now) to complete payment. Then return and press (I Paid).",
-    },
-    "btn_pay_now": {"ar": "🔗 ادفع الآن", "en": "🔗 Pay Now"},
-    "btn_paid": {"ar": "✅ دفعت", "en": "✅ I Paid"},
-    "thank_you": {
-        "ar": f"🎉 شكراً لاختيارك {BRAND}!",
-        "en": f"🎉 Thank you for choosing {BRAND}!",
-    },
-    "breadcrumb_sel": {"ar": "🧩 تم حفظ اختيارك: {pkg} ({price} درهم)", "en": "🧩 Selection saved: {pkg} ({price} AED)"},
-    "breadcrumb_agree": {"ar": "✅ وافق على المتابعة: {pkg}", "en": "✅ Agreed to proceed: {pkg}"},
-    "breadcrumb_paid": {
-        "ar": "🧾 تم الضغط على (دفعت)\n• الباقة: {pkg}\n• الوقت: {ts}",
-        "en": "🧾 Payment confirmation clicked\n• Package: {pkg}\n• Time: {ts}",
-        "en_short": "🧾 I Paid • {pkg} • {ts}",
-    },
-    "phone_request": {
-        "ar": "📞 شارك رقم هاتفك للتواصل.\nاضغط (مشاركة رقمي) أو اكتب الرقم مع رمز الدولة (مثل +9715xxxxxxx).",
-        "en": "📞 Please share your phone number.\nTap (Share my number) or type it including country code (e.g., +9715xxxxxxx).",
-    },
-    "btn_share_phone": {"ar": "📲 مشاركة رقمي", "en": "📲 Share my number"},
-    "phone_saved": {"ar": "✅ تم حفظ رقمك. سنتواصل معك قريباً.", "en": "✅ Number saved. We’ll contact you soon."},
-
-    # Offers UI texts
-    "offers_title": {"ar": "🎁 العروض المتاحة الآن", "en": "🎁 Available offers now"},
-    "offers_none": {"ar": "لا توجد عروض متاحة الآن", "en": "no offer"},
-
-    # Renew / Username
-    "ask_username": {
-        "ar": "👤 اكتب اسم المستخدم (username) المستخدم في التطبيق للتجديد.",
-        "en": "👤 Please type the account username you use in the player for renewal.",
-    },
-    "username_saved": {"ar": "✅ تم حفظ اسم المستخدم.", "en": "✅ Username saved."},
-
-    # Trial
-    "trial_pick": {
-        "ar": "🧪 اختر باقة للتجربة المجانية (مرة كل 30 يومًا لكل رقم ولكل باقة):",
-        "en": "🧪 Choose a package for the free trial (once every 30 days per phone per package):",
-    },
-    "trial_recorded": {"ar": "✅ تم تسجيل طلب التجربة. سيتم التواصل معك لإرسال البيانات.", "en": "✅ Trial request recorded. We’ll contact you to send credentials."},
-    "trial_cooldown": {
-        "ar": "❗️ تم استخدام تجربة باقة «{pkg}» مؤخرًا لهذا الرقم. اطلب تجربة جديدة بعد ~{days} يومًا.",
-        "en": "❗️ A trial for “{pkg}” was used recently for this number. Please try again in ~{days} days.",
-    },
-
-    # Support (Arabic & English labels)
-    "support_pick": {"ar": "🛟 اختر نوع المشكلة:", "en": "🛟 Choose an issue:"},
-    "support_login": {"ar": "🚪 تسجيل الدخول/التفعيل", "en": "🚪 Login/Activation"},
-    "support_buffer": {"ar": "🌐 السرعة/التقطيع", "en": "🌐 Buffering / Speed"},
-    "support_channels": {"ar": "📺 القنوات المفقودة", "en": "📺 Missing Channel"},
-    "support_billing": {"ar": "💳 الفوترة/الدفع", "en": "💳 Billing / Payment"},
-    "support_other": {"ar": "🧩 أخرى", "en": "🧩 Other"},
-    "support_detail_prompt": {
-        "ar": "اشرح المشكلة بالتفصيل.\nيمكنك إرسال لقطة شاشة إن وجدت، أو أرسل /done للإرسال.",
-        "en": "Describe the issue in detail.\nYou may send a screenshot if available, or send /done to submit.",
-    },
-    "support_saved": {"ar": "✅ تم تسجيل البلاغ وسنتواصل معك قريبًا.", "en": "✅ Your support ticket is recorded. We will contact you soon."},
-}
-
-def t(chat_id: int, key: str) -> str:
-    lang = get_state(chat_id).get("lang", "ar")
-    val = I18N.get(key)
-    if isinstance(val, dict):
-        return val.get(lang, val.get("en", ""))
-    return str(val)
-
-# ------------------------- KEYBOARDS -------------------------
-def lang_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(I18N["lang_ar"]["ar"], callback_data="lang|ar"),
-         InlineKeyboardButton(I18N["lang_en"]["en"], callback_data="lang|en")]
-    ])
-
-def main_menu_kb(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(chat_id, "btn_more_info"), callback_data="more_info"),
-         InlineKeyboardButton(t(chat_id, "btn_subscribe"), callback_data="subscribe")],
-        [InlineKeyboardButton(t(chat_id, "btn_renew"), callback_data="renew"),
-         InlineKeyboardButton(t(chat_id, "btn_trial"), callback_data="trial")],
-        [InlineKeyboardButton(t(chat_id, "btn_support"), callback_data="support"),
-         InlineKeyboardButton(t(chat_id, "btn_offers"), callback_data="offers")]
-    ])
-
-def more_info_summary_kb(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(chat_id, "btn_players_links"), callback_data="players_links")],
-        [InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")]
-    ])
-
-def players_links_kb(chat_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(chat_id, "btn_player_iplay"), callback_data="player_links|iplay")],
-        [InlineKeyboardButton(t(chat_id, "btn_player_splayer"), callback_data="player_links|splayer")],
-        [InlineKeyboardButton(t(chat_id, "btn_player_000"), callback_data="player_links|000")],
-        [InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="more_info")]
-    ])
-
-def packages_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(pkg, callback_data=f"pkg|{pkg}")] for pkg in PACKAGES.keys()]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
-    return InlineKeyboardMarkup(rows)
-
-def agree_kb(chat_id: int, pkg_name: str, reason: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(chat_id, "btn_agree"), callback_data=f"agree|{reason}|{pkg_name}")],
-        [InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")],
-    ])
-
-def pay_kb(chat_id: int, pkg_name: str, reason: str) -> InlineKeyboardMarkup:
-    pay_url = PACKAGES[pkg_name]["payment_url"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t(chat_id, "btn_pay_now"), url=pay_url)],
-        [InlineKeyboardButton(t(chat_id, "btn_paid"), callback_data=f"paid|{reason}|{pkg_name}")],
-        [InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")],
-    ])
-
-def trial_packages_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"{pkg} — {PACKAGES[pkg]['trial_hours']}h", callback_data=f"trial_pkg|{pkg}")]
-            for pkg in PACKAGES.keys()]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
-    return InlineKeyboardMarkup(rows)
-
-def support_issues_kb(chat_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(t(chat_id, "support_login"), callback_data="support_issue|login")],
-            [InlineKeyboardButton(t(chat_id, "support_buffer"), callback_data="support_issue|buffer")],
-            [InlineKeyboardButton(t(chat_id, "support_channels"), callback_data="support_issue|channels")],
-            [InlineKeyboardButton(t(chat_id, "support_billing"), callback_data="support_issue|billing")],
-            [InlineKeyboardButton(t(chat_id, "support_other"), callback_data="support_issue|other")],
-            [InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")]]
-    return InlineKeyboardMarkup(rows)
+def parse_date_str(d: str) -> date:
+    return datetime.strptime(d, "%Y-%m-%d").date()
 
 
-def customer_main_keyboard(chat_id: int) -> ReplyKeyboardMarkup:
-    """Bottom menu for customers (like driver bot) — works on iPhone and Android.
+def format_date(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
 
-    Buttons reuse the same labels as the inline main menu:
-    - Offers, Subscribe/Packages, Renew, Trial, Support, More Info
+
+def parse_iso_datetime(dt: str) -> datetime:
+    return datetime.fromisoformat(dt)
+
+
+def clamp_period_to_active(start_d: date, end_d: date, data: Dict[str, Any]) -> Optional[Tuple[date, date]]:
     """
+    Clamp [start_d, end_d] by:
+    - start at max(week_start_date, start_d)
+    - end at min(today, end_d)
+    If the range is invalid, return None.
+    """
+    wd_str = data.get("week_start_date")
+    if wd_str:
+        try:
+            wd = parse_date_str(wd_str)
+            if wd > start_d:
+                start_d = wd
+        except Exception:
+            pass
+
+    today = today_dubai()
+    if end_d > today:
+        end_d = today
+
+    if start_d > end_d:
+        return None
+    return (start_d, end_d)
+
+
+# ---------- Authorization ----------
+
+def is_admin(user_id: Optional[int]) -> bool:
+    return user_id in ALLOWED_ADMINS if user_id is not None else False
+
+
+def is_driver_user(data: Dict[str, Any], user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    return str(user_id) in data.get("drivers", {})
+
+
+async def ensure_admin(update: Update) -> bool:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        msg = "❌ You are not authorized to use this bot."
+        if update.message:
+            await update.message.reply_text(msg)
+        return False
+    return True
+
+
+# ---------- Driver helpers ----------
+
+def get_primary_driver(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    drivers = data.get("drivers", {})
+    # try primary
+    for d in drivers.values():
+        if d.get("active", True) and d.get("is_primary", False):
+            return d
+    # fallback: any active driver
+    for d in drivers.values():
+        if d.get("active", True):
+            return d
+    return None
+
+
+def get_driver_by_id(data: Dict[str, Any], driver_id: int) -> Optional[Dict[str, Any]]:
+    return data.get("drivers", {}).get(str(driver_id))
+
+
+def drivers_list_text(data: Dict[str, Any]) -> str:
+    drivers = data.get("drivers", {})
+    if not drivers:
+        return "No drivers added yet."
+    lines = ["🚕 *Drivers list:*"]
+    for d in drivers.values():
+        flag = "⭐ Primary" if d.get("is_primary", False) else ""
+        active = "✅ Active" if d.get("active", True) else "❌ Inactive"
+        lines.append(
+            f"- ID: `{d['id']}` — *{d['name']}* ({active}) {flag}"
+        )
+    return "\n".join(lines)
+
+
+# ---------- School days / base computation ----------
+
+def is_school_day(d: date) -> bool:
+    # Monday=0 .. Sunday=6; school Mon–Fri
+    return d.weekday() < 5
+
+
+def school_days_between(start_d: date, end_d: date, no_school_dates: List[str]) -> int:
+    ns_set = set(no_school_dates)
+    count = 0
+    cur = start_d
+    while cur <= end_d:
+        if is_school_day(cur) and format_date(cur) not in ns_set:
+            count += 1
+        cur += timedelta(days=1)
+    return count
+
+
+def filter_trips_by_date_range(
+    trips: List[Dict[str, Any]],
+    start_d: date,
+    end_d: date,
+    include_test: bool = False,
+) -> List[Dict[str, Any]]:
+    out = []
+    for t in trips:
+        try:
+            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        except Exception:
+            continue
+        d = dt.date()
+        if d < start_d or d > end_d:
+            continue
+        if not include_test and t.get("is_test", False):
+            continue
+        out.append(t)
+    return out
+
+
+def filter_trips_by_month(trips: List[Dict[str, Any]], year: int, month: int, data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Tuple[date, date]]]:
+    start_d = date(year, month, 1)
+    if month == 12:
+        end_d = date(year, 12, 31)
+    else:
+        end_d = date(year, month + 1, 1) - timedelta(days=1)
+    clamped = clamp_period_to_active(start_d, end_d, data)
+    if not clamped:
+        return [], None
+    s, e = clamped
+    trips_filtered = filter_trips_by_date_range(trips, s, e, include_test=False)
+    return trips_filtered, (s, e)
+
+
+def filter_trips_by_year(trips: List[Dict[str, Any]], year: int, data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[Tuple[date, date]]]:
+    start_d = date(year, 1, 1)
+    end_d = date(year, 12, 31)
+    clamped = clamp_period_to_active(start_d, end_d, data)
+    if not clamped:
+        return [], None
+    s, e = clamped
+    trips_filtered = filter_trips_by_date_range(trips, s, e, include_test=False)
+    return trips_filtered, (s, e)
+
+
+# ---------- Text builders ----------
+
+def build_period_report(
+    data: Dict[str, Any],
+    start_d: date,
+    end_d: date,
+    title: str,
+) -> str:
+    """Full admin report for [start_d, end_d] (already clamped)."""
+    base_weekly = data["base_weekly"]
+    no_school_dates = data["no_school_dates"]
+    trips = data["trips"]
+    drivers = data["drivers"]
+
+    school_days = school_days_between(start_d, end_d, no_school_dates)
+    base_per_day = base_weekly / SCHOOL_DAYS_PER_WEEK
+    school_base_total = base_per_day * school_days
+
+    period_trips = filter_trips_by_date_range(trips, start_d, end_d, include_test=False)
+    extra_total = sum(t["amount"] for t in period_trips)
+
+    grand_total = school_base_total + extra_total
+
+    lines = [
+        f"{title} (from {format_date(start_d)} to {format_date(end_d)})",
+        "",
+        "🎓 School base (daily):",
+        f"• Weekly base: {base_weekly:.2f} AED",
+        f"• Base per school day: {base_per_day:.2f} AED",
+        f"• School days (excluding no-school): {school_days}",
+        f"• School base total: {school_base_total:.2f} AED",
+        "",
+        "🚗 Extra trips (REAL):",
+        f"• Count: {len(period_trips)}",
+        f"• Extra total: {extra_total:.2f} AED",
+        "",
+        f"✅ Grand total: {grand_total:.2f} AED",
+    ]
+
+    # Per-driver breakdown
+    if period_trips:
+        lines.append("")
+        lines.append("🚕 *Per-driver extra totals:*")
+        extra_by_driver: Dict[str, float] = {}
+        for t in period_trips:
+            did = str(t.get("driver_id", "unknown"))
+            extra_by_driver[did] = extra_by_driver.get(did, 0.0) + t["amount"]
+        for did, amount in extra_by_driver.items():
+            d = drivers.get(did)
+            d_name = d["name"] if d else f"Driver {did}"
+            lines.append(f"- {d_name} ({did}): {amount:.2f} AED")
+
+        lines.append("")
+        lines.append("📋 Trip details:")
+        for t in sorted(period_trips, key=lambda x: x["id"]):
+            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+            by = t.get("user_name") or f"ID {t.get('user_id','?')}"
+            d = drivers.get(str(t.get("driver_id")))
+            d_name = d["name"] if d else f"Driver {t.get('driver_id','?')}"
+            lines.append(
+                f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED "
+                f"(by {by}, driver: {d_name})"
+            )
+
+    return "\n".join(lines)
+
+
+def build_driver_weekly_report(
+    data: Dict[str, Any],
+    driver_id: int,
+) -> Optional[str]:
+    driver = get_driver_by_id(data, driver_id)
+    if not driver or not driver.get("active", True):
+        return None
+
+    today = today_dubai()
+    monday = today - timedelta(days=today.weekday())  # Monday of this week
+    clamped = clamp_period_to_active(monday, today, data)
+    if not clamped:
+        return None
+    start_d, end_d = clamped
+
+    base_weekly = data["base_weekly"]
+    no_school_dates = data["no_school_dates"]
+    trips = data["trips"]
+
+    school_days = school_days_between(start_d, end_d, no_school_dates)
+    base_per_day = base_weekly / SCHOOL_DAYS_PER_WEEK
+    school_base_total = base_per_day * school_days
+
+    # Only this driver's trips
+    all_period = filter_trips_by_date_range(trips, start_d, end_d, include_test=False)
+    d_trips = [t for t in all_period if str(t.get("driver_id")) == str(driver_id)]
+    extra_total = sum(t["amount"] for t in d_trips)
+    grand_total = school_base_total + extra_total
+
+    lines = [
+        f"🚕 Driver Weekly Report — {driver['name']} ({driver_id})",
+        f"Period: {format_date(start_d)} → {format_date(end_d)}",
+        "",
+        "🎓 School base (daily):",
+        f"• Weekly base: {base_weekly:.2f} AED",
+        f"• Base per school day: {base_per_day:.2f} AED",
+        f"• School days (excluding no-school): {school_days}",
+        f"• School base total: {school_base_total:.2f} AED",
+        "",
+        "🚗 Extra trips (REAL):",
+        f"• Count: {len(d_trips)}",
+        f"• Extra total: {extra_total:.2f} AED",
+        "",
+        f"✅ Grand total: {grand_total:.2f} AED",
+    ]
+
+    if d_trips:
+        lines.append("")
+        lines.append("📋 Trip details:")
+        for t in sorted(d_trips, key=lambda x: x["id"]):
+            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+            by = t.get("user_name") or f"ID {t.get('user_id','?')}"
+            lines.append(
+                f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED (by {by})"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------- Menus ----------
+
+def admin_main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
-        [KeyboardButton(t(chat_id, "btn_offers")), KeyboardButton(t(chat_id, "btn_subscribe"))],
-        [KeyboardButton(t(chat_id, "btn_renew")), KeyboardButton(t(chat_id, "btn_trial"))],
-        [KeyboardButton(t(chat_id, "btn_support")), KeyboardButton(t(chat_id, "btn_more_info"))],
+        [KeyboardButton(BTN_ADD_TRIP), KeyboardButton(BTN_LIST_TRIPS)],
+        [KeyboardButton(BTN_WEEKLY_REPORT), KeyboardButton(BTN_MONTH_REPORT), KeyboardButton(BTN_YEAR_REPORT)],
+        [KeyboardButton(BTN_NOSCHOOL_MENU), KeyboardButton(BTN_DRIVERS_MENU)],
+        [KeyboardButton(BTN_EXPORT_CSV), KeyboardButton(BTN_CLEAR_TRIPS)],
+        [KeyboardButton(BTN_TOGGLE_TEST)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-def phone_request_kb(chat_id: int) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton(t(chat_id, "btn_share_phone"), request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True, input_field_placeholder="Tap to share, or type your number…"
-    )
 
-# Offer package selection keyboard
-def offer_packages_kb(idx: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("Casual", callback_data=f"offer_pkg|{idx}|Casual"),
-         InlineKeyboardButton("Executive", callback_data=f"offer_pkg|{idx}|Executive")],
-        [InlineKeyboardButton("Premium", callback_data=f"offer_pkg|{idx}|Premium"),
-         InlineKeyboardButton("Kids", callback_data=f"offer_pkg|{idx}|Kids")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="offers")]
+
+def noschool_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(BTN_NOSCHOOL_TODAY), KeyboardButton(BTN_NOSCHOOL_TOMORROW)],
+        [KeyboardButton(BTN_NOSCHOOL_PICKDATE)],
+        [KeyboardButton(BTN_BACK_MAIN)],
     ]
-    return InlineKeyboardMarkup(rows)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ------------------------- HELPERS -------------------------
-async def safe_edit_or_send(query, context, chat_id: int, text: str,
-                            kb, html: bool = False, no_preview: bool = False) -> None:
-    """Edits callback message OR sends new message. If kb is ReplyKeyboardMarkup, send only a new message."""
-    try:
-        if isinstance(kb, ReplyKeyboardMarkup):
-            await context.bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=kb,
-                parse_mode="HTML" if html else None, disable_web_page_preview=no_preview
-            )
-        else:
-            await query.edit_message_text(
-                text, reply_markup=kb if isinstance(kb, InlineKeyboardMarkup) else None,
-                parse_mode="HTML" if html else None, disable_web_page_preview=no_preview,
-            )
-    except Exception as e:
-        logging.warning("safe_edit_or_send fallback: %s", e)
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id, text=text, reply_markup=kb,
-                parse_mode="HTML" if html else None, disable_web_page_preview=no_preview
-            )
-        except Exception as e2:
-            logging.error("send_message failed: %s", e2)
 
-def pkg_details_for_lang(pkg_name: str, lang: str) -> str:
-    pkg = PACKAGES.get(pkg_name)
-    if not pkg:
-        return ""
-    return pkg["details_ar"] if lang == "ar" else pkg["details_en"]
+def drivers_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(BTN_DRIVERS_LIST)],
+        [KeyboardButton(BTN_DRIVERS_ADD), KeyboardButton(BTN_DRIVERS_REMOVE)],
+        [KeyboardButton(BTN_DRIVERS_SET_PRIMARY)],
+        [KeyboardButton(BTN_BACK_MAIN)],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def _is_admin(user_id: int) -> bool:
-    try:
-        return ADMIN_CHAT_ID is not None and int(ADMIN_CHAT_ID) == int(user_id)
-    except Exception:
-        return False
 
-def _fmt_offer(o: dict, lang: str) -> str:
-    title = o["title_ar"] if lang == "ar" else o["title_en"]
-    s_uae = _parse_iso(o["start_at"]).astimezone(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    e_uae = _parse_iso(o["end_at"]).astimezone(DUBAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    return f"• {title}\n  🕒 {s_uae} → {e_uae} (UAE)"
+def driver_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(BTN_DRIVER_MY_WEEK)],
+        [KeyboardButton(BTN_DRIVER_MY_REPORT)],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-async def _send_phone_prompt(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Single, non-duplicated phone prompt."""
-    await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "phone_request"), reply_markup=phone_request_kb(chat_id))
 
-# ------------------------- FLOWS (post-phone continuation) -------------------------
-async def _post_phone_continuations(update: Update, context: ContextTypes.DEFAULT_TYPE, phone: str):
-    chat_id = update.effective_chat.id
-    st = get_state(chat_id)
-    reason = st.get("awaiting_phone_reason")
+# ---------- Commands: Start ----------
 
-    # SUBSCRIBE
-    if reason == "subscribe":
-        await update.message.reply_text(t(chat_id, "thank_you"), reply_markup=main_menu_kb(chat_id))
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-        return
-
-    # OFFER
-    if reason == "offer":
-        await update.message.reply_text(t(chat_id, "thank_you"), reply_markup=main_menu_kb(chat_id))
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-        return
-
-    # RENEW (username already captured)
-    if reason == "renew":
-        await update.message.reply_text(t(chat_id, "thank_you"), reply_markup=main_menu_kb(chat_id))
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None, awaiting_username=False, awaiting_username_reason=None)
-        return
-
-    # TRIAL (per phone PER PACKAGE cooldown 30d)
-    if reason == "trial":
-        pkg = st.get("trial_pkg")
-        last_ok = None
-        for r in iter_jsonl(TRIALS_FILE):
-            if r.get("phone") == phone and r.get("package") == pkg:
-                try:
-                    when = datetime.fromisoformat(r.get("created_at"))
-                except Exception:
-                    when = _now_uae()
-                if not last_ok or when > last_ok:
-                    last_ok = when
-        if last_ok and (_now_uae() - last_ok) < timedelta(days=30):
-            days_left = 30 - (_now_uae() - last_ok).days
-            msg = I18N["trial_cooldown"]["ar" if get_state(chat_id).get("lang", "ar") == "ar" else "en"].format(pkg=pkg, days=days_left)
-            await update.message.reply_text(msg, reply_markup=main_menu_kb(chat_id))
-            set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None, trial_pkg=None)
-            return
-
-        hours = PACKAGES[pkg]["trial_hours"] if pkg in PACKAGES else 0
-        tid = save_jsonl(TRIALS_FILE, {
-            "tg_chat_id": chat_id,
-            "tg_user_id": update.effective_user.id,
-            "tg_username": update.effective_user.username,
-            "phone": phone,
-            "package": pkg,
-            "trial_hours": hours,
-            "created_at": _now_uae().isoformat(),
-            "status": "open"
-        })
-        await update.message.reply_text(t(chat_id, "trial_recorded"), reply_markup=main_menu_kb(chat_id))
-        if ADMIN_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=(f"🧪 NEW TRIAL REQUEST\nTicket #{tid}\n"
-                      f"User: @{update.effective_user.username or 'N/A'} ({update.effective_user.id})\n"
-                      f"Phone: {phone}\nPackage: {pkg}\nHours: {hours}")
-            )
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None, trial_pkg=None)
-        return
-
-    # SUPPORT
-    if reason == "support":
-        await update.message.reply_text(t(chat_id, "support_saved"), reply_markup=main_menu_kb(chat_id))
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-        return
-
-# ------------------------- HANDLERS -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(t(chat_id, "pick_lang"), reply_markup=lang_kb())
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await start(update, context)
-
-async def packages_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show subscription packages (same as Subscribe button)."""
-    chat_id = update.effective_chat.id
-    # Start subscribe flow
-    set_state(chat_id, flow="subscribe", awaiting_phone=False, awaiting_phone_reason=None)
-    await update.message.reply_text(t(chat_id, "subscribe_pick"), reply_markup=packages_kb())
-
-async def renew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start renewal flow (same as Renew button)."""
-    chat_id = update.effective_chat.id
-    set_state(chat_id, flow="renew", awaiting_phone=False, awaiting_phone_reason=None)
-    await update.message.reply_text(t(chat_id, "subscribe_pick"), reply_markup=packages_kb())
-
-async def trial_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start free trial flow (same as Trial button)."""
-    chat_id = update.effective_chat.id
-    set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-    await update.message.reply_text(t(chat_id, "trial_pick"), reply_markup=trial_packages_kb())
-
-async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open support ticket flow (same as Support button)."""
-    chat_id = update.effective_chat.id
-    set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-    await update.message.reply_text(t(chat_id, "support_pick"), reply_markup=support_issues_kb(chat_id))
-
-async def offers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show active offers (same as Offers button)."""
-    chat_id = update.effective_chat.id
-    acts = active_offers()
-    if not acts:
-        await update.message.reply_text(t(chat_id, "offers_none"))
+    data = load_data()
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
         return
-    rows = []
-    lang = get_state(chat_id).get("lang", "ar")
-    for idx, o in enumerate(acts):
-        title = o["title_ar"] if lang == "ar" else o["title_en"]
-        rows.append([InlineKeyboardButton(title, callback_data=f"offer_act|{idx}")])
-    rows.append([InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")])
-    await update.message.reply_text(t(chat_id, "offers_title"), reply_markup=InlineKeyboardMarkup(rows))
 
-async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show more info about AECyberTV (same as More Info button)."""
-    chat_id = update.effective_chat.id
-    text = t(chat_id, "more_info_title") + "\n\n" + t(chat_id, "more_info_body_compact")
-    await update.message.reply_text(text, reply_markup=more_info_summary_kb(chat_id), disable_web_page_preview=True)
+    user_id = user.id
 
+    # Admin view
+    if is_admin(user_id):
+        if chat.id not in data["admin_chats"]:
+            data["admin_chats"].append(chat.id)
+            save_data(data)
 
-# Admin/utility commands
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ Admin only.")
+        msg = (
+            "👋 *DriverSchoolBot – Admin Mode*\n\n"
+            "You can track extra trips, school base, holidays and notify drivers.\n\n"
+            "Main commands:\n"
+            "• /setbase <amount> – change weekly base (default 725)\n"
+            "• /setweekstart <YYYY-MM-DD> – when driver calculations start\n"
+            "• /getweekstart – show current start date\n"
+            "• /trip <amount> <destination> – add trip for primary driver\n"
+            "• /tripfor <driver_id> <amount> <destination> – for specific driver\n"
+            "• /report – weekly report\n"
+            "• /month [YYYY-MM] – monthly report\n"
+            "• /year [YYYY] – yearly report\n"
+            "• /noschool [today|tomorrow|YYYY-MM-DD]\n"
+            "• /holiday YYYY-MM-DD YYYY-MM-DD\n"
+            "• /adddriver <telegram_id> <name>\n"
+            "• /removedriver <telegram_id>\n"
+            "• /setprimarydriver <telegram_id>\n"
+            "• /drivers – list drivers\n"
+            "• /export – export CSV\n"
+            "• /test_on /test_off – test mode\n\n"
+            "You can also use the buttons below."
+        )
+        save_data(data)
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_main_keyboard())
         return
-    mode = "webhook" if WEBHOOK_URL else "polling"
+
+    # Driver view
+    data = load_data()
+    if is_driver_user(data, user_id):
+        d = data["drivers"][str(user_id)]
+        msg = (
+            f"🚕 *Welcome, {d['name']}!* \n\n"
+            "Use the buttons below:\n"
+            "• \"📦 My Week\" – short summary\n"
+            "• \"🧾 My Weekly Report\" – full details\n"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=driver_keyboard())
+        return
+
+    # Not admin, not driver
+    await update.message.reply_text("❌ You are not authorized to use this bot.")
+
+
+# ---------- Admin Commands ----------
+
+async def set_base(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /setbase 725")
+        return
+    try:
+        amount = float(context.args[0])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Amount must be a positive number.")
+        return
+
+    data = load_data()
+    data["base_weekly"] = amount
+    save_data(data)
+    await update.message.reply_text(f"✅ Weekly base updated to {amount:.2f} AED")
+
+
+async def set_week_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /setweekstart YYYY-MM-DD")
+        return
+    try:
+        d = parse_date_str(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
+        return
+    data = load_data()
+    data["week_start_date"] = format_date(d)
+    save_data(data)
+    await update.message.reply_text(f"✅ Calculations will start from {format_date(d)}.")
+
+
+async def get_week_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    wd = data.get("week_start_date")
+    if wd:
+        await update.message.reply_text(f"📅 Current start date for calculations: {wd}")
+    else:
+        await update.message.reply_text("No start date set yet. Use /setweekstart YYYY-MM-DD.")
+
+
+async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /adddriver <telegram_id> <name>")
+        return
+
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver Telegram ID must be a number.")
+        return
+
+    name = " ".join(context.args[1:])
+    data = load_data()
+    drivers = data["drivers"]
+
+    first_driver = len(drivers) == 0
+
+    drivers[str(driver_id)] = {
+        "id": driver_id,
+        "name": name,
+        "active": True,
+        "is_primary": first_driver,  # first added becomes primary by default
+    }
+    save_data(data)
+
+    flag = " (primary)" if first_driver else ""
+    await update.message.reply_text(f"✅ Driver added: {name} ({driver_id}){flag}")
+
+
+async def removedriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removedriver <telegram_id>")
+        return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver Telegram ID must be a number.")
+        return
+
+    data = load_data()
+    drivers = data["drivers"]
+    key = str(driver_id)
+    if key not in drivers:
+        await update.message.reply_text("Driver not found.")
+        return
+
+    name = drivers[key]["name"]
+    del drivers[key]
+    save_data(data)
+    await update.message.reply_text(f"🗑 Driver removed: {name} ({driver_id})")
+
+
+async def setprimarydriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /setprimarydriver <telegram_id>")
+        return
+    try:
+        driver_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver Telegram ID must be a number.")
+        return
+
+    data = load_data()
+    drivers = data["drivers"]
+    key = str(driver_id)
+    if key not in drivers:
+        await update.message.reply_text("Driver not found.")
+        return
+
+    for d in drivers.values():
+        d["is_primary"] = False
+    drivers[key]["is_primary"] = True
+    save_data(data)
     await update.message.reply_text(
-        f"✅ Status\nMode: {mode}\nUTC: {_utcnow().strftime('%Y-%m-%d %H:%M:%S')}\nUAE: {_now_uae().strftime('%Y-%m-%d %H:%M:%S')}\nActive offers: {len(active_offers())}"
+        f"⭐ Primary driver set to {drivers[key]['name']} ({driver_id})"
     )
 
-async def offers_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ Admin only.")
-        return
-    acts = active_offers()
-    if not acts:
-        await update.message.reply_text("no offer")
-        return
-    lines = ["Available offers now:"]
-    for o in acts:
-        lines.append(_fmt_offer(o, get_state(update.effective_chat.id).get("lang","ar")))
-    await update.message.reply_text("\n".join(lines))
 
-async def upcoming_offers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ Admin only.")
+async def drivers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
         return
-    ups = upcoming_offers()
-    if not ups:
-        await update.message.reply_text("no offer")
+    data = load_data()
+    text = drivers_list_text(data)
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def add_trip_common(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    amount: float,
+    destination: str,
+    driver: Dict[str, Any],
+) -> None:
+    """Create a trip, notify admins and driver."""
+    data = load_data()
+    now = now_dubai()
+    trip_id = data["next_trip_id"]
+    data["next_trip_id"] += 1
+
+    is_test = data.get("test_mode", False)
+
+    user = update.effective_user
+    trip = {
+        "id": trip_id,
+        "date": now.isoformat(),
+        "amount": amount,
+        "destination": destination,
+        "user_id": user.id if user else None,
+        "user_name": user.first_name if user else "",
+        "driver_id": driver["id"],
+        "driver_name": driver["name"],
+        "is_test": is_test,
+    }
+    data["trips"].append(trip)
+    save_data(data)
+
+    pretty = now.strftime("%Y-%m-%d %H:%M")
+    test_label = "🧪 [TEST] " if is_test else ""
+
+    # Confirm to who added
+    await update.message.reply_text(
+        f"✅ {test_label}Trip added\n"
+        f"🆔 ID: {trip_id}\n"
+        f"📅 {pretty}\n"
+        f"📍 {destination}\n"
+        f"💰 {amount:.2f} AED\n"
+        f"🚕 Driver: {driver['name']} ({driver['id']})"
+    )
+
+    if not is_test:
+        # Notify admins
+        admin_msg = (
+            "🔔 New trip added by someone in the family:\n"
+            f"🆔 ID: {trip_id}\n"
+            f"📅 {pretty}\n"
+            f"📍 {destination}\n"
+            f"💰 {amount:.2f} AED\n"
+            f"👤 Added by Telegram ID: {trip['user_id']}\n"
+            f"🚗 For driver: {driver['name']} ({driver['id']})"
+        )
+        for chat_id in data.get("admin_chats", []):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=admin_msg)
+            except Exception:
+                continue
+
+        # Notify driver
+        try:
+            await context.bot.send_message(
+                chat_id=driver["id"],
+                text=(
+                    "🚗 New extra trip recorded:\n"
+                    f"🆔 ID: {trip_id}\n"
+                    f"📅 {pretty}\n"
+                    f"📍 {destination}\n"
+                    f"💰 {amount:.2f} AED\n"
+                    f"👤 Recorded by: {trip['user_name'] or trip['user_id']}"
+                )
+            )
+        except Exception:
+            pass
+
+
+async def trip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
         return
-    lines = ["Upcoming offers:"]
-    for o in ups:
-        lines.append(_fmt_offer(o, get_state(update.effective_chat.id).get("lang","ar")))
-    await update.message.reply_text("\n".join(lines))
-
-async def offer_reload_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ Admin only.")
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /trip <amount> <destination>\nExample: /trip 35 Dubai Mall"
+        )
         return
-    global OFFERS_ALL
-    OFFERS_ALL = build_embedded_offers()
-    await update.message.reply_text("Offers reloaded.")
+    try:
+        amount = float(context.args[0])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Amount must be a positive number.")
+        return
+    destination = " ".join(context.args[1:])
 
-async def debug_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(f"Your Telegram user id: {update.effective_user.id}")
-
-# Text / Contact / Photos
-async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    st = get_state(chat_id)
-    txt = (update.message.text or "").strip()
-
-    # Support details flow
-    if context.user_data.get("support_stage") == "await_details":
-        context.user_data["support_details"] = txt
-        context.user_data["support_stage"] = "await_optional_screenshot"
-        await update.message.reply_text(t(chat_id, "support_detail_prompt"))
+    data = load_data()
+    driver = get_primary_driver(data)
+    if not driver:
+        await update.message.reply_text("No driver found. Use /adddriver first.")
         return
 
-    # Username flow (renew)
-    if st.get("awaiting_username") and st.get("awaiting_username_reason") == "renew":
-        set_state(chat_id, awaiting_username=False)
-        save_customer(chat_id, update.effective_user, st.get("package"), st.get("phone"), extra={"username_for_renew": txt})
-        await update.message.reply_text(t(chat_id, "username_saved"))
-        set_state(chat_id, awaiting_phone=True, awaiting_phone_reason="renew")
-        await _send_phone_prompt(context, chat_id)
+    await add_trip_common(update, context, amount, destination, driver)
+
+
+async def tripfor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /tripfor <driver_id> <amount> <destination>\n"
+            "Example: /tripfor 981113059 40 Dubai Mall"
+        )
+        return
+    try:
+        driver_id = int(context.args[0])
+        amount = float(context.args[1])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Driver ID must be int, amount positive number.")
         return
 
-    # Phone capture by text
-    if st.get("awaiting_phone") and txt:
-        if PHONE_RE.match(txt):
-            phone = normalize_phone(txt)
-            set_state(chat_id, phone=phone)
-            save_customer(chat_id, update.effective_user, st.get("package"), phone)
-            if ADMIN_CHAT_ID:
-                try:
-                    await context.bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        text=(f"📞 Phone captured\n"
-                              f"User: @{update.effective_user.username or 'N/A'} (id: {update.effective_user.id})\n"
-                              f"Name: {update.effective_user.full_name}\n"
-                              f"Package: {st.get('package')}\n"
-                              f"Phone: {phone}\n"
-                              f"Reason: {st.get('awaiting_phone_reason')}")
-                    )
-                except Exception as e:
-                    logging.error("Admin notify (phone) failed: %s", e)
-            await update.message.reply_text(t(chat_id, "phone_saved"), reply_markup=ReplyKeyboardRemove())
-            await _post_phone_continuations(update, context, phone)
-            set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-            return
+    destination = " ".join(context.args[2:])
+    data = load_data()
+    driver = get_driver_by_id(data, driver_id)
+    if not driver or not driver.get("active", True):
+        await update.message.reply_text("Driver not found or inactive.")
+        return
+
+    await add_trip_common(update, context, amount, destination, driver)
+
+
+async def list_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    trips = data["trips"]
+    if not trips:
+        await update.message.reply_text("No trips recorded yet.")
+        return
+
+    real_total = 0.0
+    test_total = 0.0
+    lines = ["📋 *All trips (REAL + TEST):*"]
+    for t in sorted(trips, key=lambda x: x["id"]):
+        dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        d_str = dt.strftime("%Y-%m-%d")
+        test_flag = t.get("is_test", False)
+        tag = " 🧪[TEST]" if test_flag else ""
+        if test_flag:
+            test_total += t["amount"]
         else:
-            await update.message.reply_text("❗️Invalid number. Include country code (e.g., +9715xxxxxxx).",
-                                            reply_markup=phone_request_kb(chat_id))
-            return
+            real_total += t["amount"]
+        driver_name = t.get("driver_name") or f"Driver {t.get('driver_id','?')}"
+        by = t.get("user_name") or f"ID {t.get('user_id','?')}"
+        lines.append(
+            f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED{tag} "
+            f"(by {by}, driver: {driver_name})"
+        )
+    lines.append("")
+    lines.append(f"💰 REAL trips total: {real_total:.2f} AED")
+    lines.append(f"🧪 TEST trips total (ignored in reports): {test_total:.2f} AED")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-    # Bottom customer menu (ReplyKeyboard) — like driver bot
-    # Map button labels to the same flows as commands / inline buttons
-    if txt in (
-        t(chat_id, "btn_offers"),
-        t(chat_id, "btn_subscribe"),
-        t(chat_id, "btn_renew"),
-        t(chat_id, "btn_trial"),
-        t(chat_id, "btn_support"),
-        t(chat_id, "btn_more_info"),
-    ):
-        # Decide which action based on exact label
-        if txt == t(chat_id, "btn_offers"):
-            await offers_cmd(update, context)
-        elif txt == t(chat_id, "btn_subscribe"):
-            # For bottom menu, treat "Subscribe" same as "Packages"
-            await packages_cmd(update, context)
-        elif txt == t(chat_id, "btn_renew"):
-            await renew_cmd(update, context)
-        elif txt == t(chat_id, "btn_trial"):
-            await trial_cmd(update, context)
-        elif txt == t(chat_id, "btn_support"):
-            await support_cmd(update, context)
-        elif txt == t(chat_id, "btn_more_info"):
-            await info_cmd(update, context)
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
         return
-    # Default: language or menu
-    if "lang" not in st:
-        await update.message.reply_text(t(chat_id, "pick_lang"), reply_markup=lang_kb())
+    data = load_data()
+    today = today_dubai()
+    monday = today - timedelta(days=today.weekday())
+    clamped = clamp_period_to_active(monday, today, data)
+    if not clamped:
+        await update.message.reply_text("Driver calculations have not started yet.")
+        return
+    s, e = clamped
+    text = build_period_report(data, s, e, "📊 Weekly Report")
+    await update.message.reply_text(text)
+
+
+async def month_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    today = today_dubai()
+    if context.args:
+        try:
+            year_str, month_str = context.args[0].split("-")
+            year = int(year_str)
+            month = int(month_str)
+        except Exception:
+            await update.message.reply_text("Usage: /month YYYY-MM")
+            return
     else:
-        # Show inline main menu + bottom customer keyboard (works on iPhone & Android)
-        await update.message.reply_text(t(chat_id, "welcome"), reply_markup=main_menu_kb(chat_id))
-        try:
-            await update.message.reply_text("👇 Use the menu buttons below:", reply_markup=customer_main_keyboard(chat_id))
-        except Exception:
-            # Even if keyboard fails, bot still works
-            pass
+        year, month = today.year, today.month
 
-async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    contact: Contact = update.message.contact
-    phone = normalize_phone(contact.phone_number or "")
-    st = get_state(chat_id)
-    set_state(chat_id, phone=phone)
-    save_customer(chat_id, update.effective_user, st.get("package"), phone)
-
-    if ADMIN_CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(f"📞 Phone captured via Contact\n"
-                      f"User: @{update.effective_user.username or 'N/A'} (id: {update.effective_user.id})\n"
-                      f"Name: {update.effective_user.full_name}\n"
-                      f"Package: {st.get('package')}\n"
-                      f"Phone: {phone}\n"
-                      f"Reason: {st.get('awaiting_phone_reason')}")
-            )
-        except Exception as e:
-            logging.error("Admin notify (contact) failed: %s", e)
-
-    await update.message.reply_text(t(chat_id, "phone_saved"), reply_markup=ReplyKeyboardRemove())
-    await _post_phone_continuations(update, context, phone)
-    set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if context.user_data.get("support_stage") == "await_optional_screenshot":
-        photos = update.message.photo or []
-        if photos:
-            best = photos[-1].file_id
-            context.user_data.setdefault("support_photos", []).append(best)
-        await update.message.reply_text("✅ Screenshot received. Send more or /done to submit.")
+    trips = data["trips"]
+    month_trips, period = filter_trips_by_month(trips, year, month, data)
+    if not period:
+        await update.message.reply_text("Driver calculations have not started yet for that period.")
         return
+    s, e = period
+    text = build_period_report(data, s, e, f"📅 Monthly Report {year}-{month:02d}")
+    await update.message.reply_text(text)
 
-async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if context.user_data.get("support_stage") in ("await_details", "await_optional_screenshot"):
-        tid = save_jsonl(SUPPORT_FILE, {
-            "tg_chat_id": chat_id,
-            "tg_user_id": update.effective_user.id,
-            "tg_username": update.effective_user.username,
-            "details": context.user_data.get("support_details"),
-            "photos": context.user_data.get("support_photos", []),
-            "created_at": _now_uae().isoformat(),
-            "status": "open",
-            "issue_code": context.user_data.get("support_issue_code"),
-        })
-        if ADMIN_CHAT_ID:
-            pics = context.user_data.get("support_photos", [])
-            text = (f"🛟 NEW SUPPORT TICKET\n"
-                    f"Ticket #{tid}\n"
-                    f"Issue: {context.user_data.get('support_issue_code')}\n"
-                    f"User: @{update.effective_user.username or 'N/A'} ({update.effective_user.id})\n"
-                    f"Details: {context.user_data.get('support_details')}\n"
-                    f"Photos: {len(pics)}")
-            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID), text=text)
-            if pics:
-                media = [InputMediaPhoto(p) for p in pics[:10]]
-                try:
-                    await context.bot.send_media_group(chat_id=int(ADMIN_CHAT_ID), media=media)
-                except Exception:
-                    pass
-        # clear stages then ask phone
-        context.user_data["support_stage"] = None
-        context.user_data["support_details"] = None
-        context.user_data["support_photos"] = []
-        context.user_data["support_issue_code"] = None
 
-        set_state(chat_id, awaiting_phone=True, awaiting_phone_reason="support")
-        await _send_phone_prompt(context, chat_id)
+async def year_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    today = today_dubai()
+    if context.args:
+        try:
+            year = int(context.args[0])
+        except Exception:
+            await update.message.reply_text("Usage: /year YYYY")
+            return
     else:
-        await update.message.reply_text(t(chat_id, "welcome"), reply_markup=main_menu_kb(chat_id))
+        year = today.year
 
-# Callback buttons
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat.id
-    user = q.from_user
-    data = (q.data or "").strip()
-    st = get_state(chat_id)
+    trips = data["trips"]
+    year_trips, period = filter_trips_by_year(trips, year, data)
+    if not period:
+        await update.message.reply_text("Driver calculations have not started yet for that period.")
+        return
+    s, e = period
+    text = build_period_report(data, s, e, f"📅 Yearly Report {year}")
+    await update.message.reply_text(text)
 
-    if data.startswith("lang|"):
-        _, lang = data.split("|", 1)
-        if lang not in ("ar", "en"):
-            lang = "ar"
-        set_state(chat_id, lang=lang, awaiting_phone=False, awaiting_phone_reason=None,
-                  awaiting_username=False, awaiting_username_reason=None, flow=None, trial_pkg=None)
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "welcome"), main_menu_kb(chat_id))
-        # Also show bottom customer menu (ReplyKeyboard) so it appears on iPhone like driver bot
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="👇 Use the menu buttons below:",
-                reply_markup=customer_main_keyboard(chat_id)
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    trips = data["trips"]
+    if not trips:
+        await update.message.reply_text("No trips to export.")
+        return
+
+    filename = "driver_trips_export.csv"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("id,date,amount,destination,user_id,user_name,driver_id,driver_name,is_test\n")
+        for t in sorted(trips, key=lambda x: x["id"]):
+            f.write(
+                f"{t['id']},{t['date']},{t['amount']},"
+                f"\"{t['destination'].replace('\"','\"\"')}\","
+                f"{t.get('user_id','')},"
+                f"\"{(t.get('user_name') or '').replace('\"','\"\"')}\","
+                f"{t.get('driver_id','')},"
+                f"\"{(t.get('driver_name') or '').replace('\"','\"\"')}\","
+                f"{1 if t.get('is_test', False) else 0}\n"
             )
-        except Exception:
-            pass
+
+    await update.message.reply_document(
+        document=InputFile(filename),
+        filename=filename,
+        caption="📄 All trips exported as CSV (REAL + TEST).",
+    )
+
+
+async def clear_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    count = len(data["trips"])
+    data["trips"] = []
+    data["next_trip_id"] = 1
+    save_data(data)
+    await update.message.reply_text(f"🧹 Cleared all trips. Removed {count} records.")
+
+
+# ---------- No-school & Holiday ----------
+
+async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+
+    # Parse "today" / "tomorrow" / date
+    if context.args:
+        arg = context.args[0].lower()
+        if arg == "today":
+            d = today_dubai()
+        elif arg == "tomorrow":
+            d = today_dubai() + timedelta(days=1)
+        else:
+            try:
+                d = parse_date_str(context.args[0])
+            except Exception:
+                await update.message.reply_text("Use /noschool today, /noschool tomorrow or /noschool YYYY-MM-DD.")
+                return
+    else:
+        d = today_dubai()
+
+    d_str = format_date(d)
+    if d_str not in data["no_school_dates"]:
+        data["no_school_dates"].append(d_str)
+        data["no_school_dates"].sort()
+        save_data(data)
+        await update.message.reply_text(f"✅ Marked {d_str} as no-school day.")
+    else:
+        await update.message.reply_text(f"ℹ️ {d_str} is already no-school.")
+
+    # Notify drivers about this no-school date
+    drivers = [drv for drv in data.get("drivers", {}).values() if drv.get("active", True)]
+    if drivers:
+        text = f"🏫 No school on {d_str}. No pickup needed that day."
+        for drv in drivers:
+            try:
+                await context.bot.send_message(chat_id=drv["id"], text=text)
+            except Exception:
+                continue
+
+
+async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Use: /holiday YYYY-MM-DD YYYY-MM-DD\nExample: /holiday 2025-12-02 2025-12-05"
+        )
+        return
+    try:
+        start_d = parse_date_str(context.args[0])
+        end_d = parse_date_str(context.args[1])
+    except Exception:
+        await update.message.reply_text("Dates must be in YYYY-MM-DD format.")
+        return
+    if end_d < start_d:
+        await update.message.reply_text("End date must be after or equal to start date.")
         return
 
-    if "lang" not in st:
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "pick_lang"), lang_kb())
-        return
+    data = load_data()
 
-    if data == "back_home":
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None,
-                  awaiting_username=False, awaiting_username_reason=None, flow=None)
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "welcome"), main_menu_kb(chat_id))
-        return
+    # Mark all days as no-school
+    no_school_set = set(data["no_school_dates"])
+    cur = start_d
+    added = 0
+    while cur <= end_d:
+        d_str = format_date(cur)
+        if d_str not in no_school_set:
+            no_school_set.add(d_str)
+            added += 1
+        cur += timedelta(days=1)
+    data["no_school_dates"] = sorted(no_school_set)
 
-    # ===== More Info (summary + links) =====
-    if data == "more_info":
-        text = t(chat_id, "more_info_title") + "\n\n" + t(chat_id, "more_info_body_compact")
-        await safe_edit_or_send(q, context, chat_id, text, more_info_summary_kb(chat_id), no_preview=True)
-        return
+    # Store holiday range with notification flags
+    holiday_ranges = data.get("holiday_ranges", [])
+    holiday_ranges.append(
+        {
+            "start": format_date(start_d),
+            "end": format_date(end_d),
+            "notified_on_create": False,
+            "notified_before_start": False,
+            "notified_before_end": False,
+        }
+    )
+    data["holiday_ranges"] = holiday_ranges
+    save_data(data)
 
-    if data == "players_links":
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "players_links_title"), players_links_kb(chat_id))
-        return
-
-    if data.startswith("player_links|"):
-        _, which = data.split("|", 1)
-        if which == "iplay":
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "player_iplay_body"), players_links_kb(chat_id))
-            return
-        if which == "splayer":
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "player_splayer_body"), players_links_kb(chat_id))
-            return
-        if which == "000":
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "player_000_body"), players_links_kb(chat_id))
-            return
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "players_links_title"), players_links_kb(chat_id))
-        return
-
-    # Subscribe
-    if data == "subscribe":
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "subscribe_pick"), packages_kb())
-        set_state(chat_id, flow="subscribe")
-        return
-
-    # Renew
-    if data == "renew":
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "subscribe_pick"), packages_kb())
-        set_state(chat_id, flow="renew")
-        return
-
-    # Trial
-    if data == "trial":
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "trial_pick"), trial_packages_kb())
-        return
-
-    if data.startswith("trial_pkg|"):
-        _, pkg_name = data.split("|", 1)
-        if pkg_name not in PACKAGES:
-            await safe_edit_or_send(q, context, chat_id, "Package not found.", trial_packages_kb())
-            return
-        set_state(chat_id, trial_pkg=pkg_name, awaiting_phone=True, awaiting_phone_reason="trial")
-        await _send_phone_prompt(context, chat_id)
-        return
-
-    # Support
-    if data == "support":
-        set_state(chat_id, awaiting_phone=False, awaiting_phone_reason=None)
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "support_pick"), support_issues_kb(chat_id))
-        return
-
-    if data.startswith("support_issue|"):
-        # Avoid duplicate prompt
-        if context.user_data.get("support_stage") in ("await_details", "await_optional_screenshot"):
-            await q.answer("Support ticket already open. Please describe the issue or send /done.")
-            return
-
-        _, code = data.split("|", 1)
-        tid = save_jsonl(SUPPORT_FILE, {
-            "tg_chat_id": chat_id,
-            "tg_user_id": user.id,
-            "tg_username": user.username,
-            "issue_code": code,
-            "status": "open",
-            "created_at": _now_uae().isoformat(),
-        })
-        context.user_data["support_ticket_seed"] = tid
-        context.user_data["support_issue_code"] = code
-        context.user_data["support_stage"] = "await_details"
-
+    # Notify admins
+    msg_admin = (
+        "🎉 *Holiday set*\n\n"
+        f"From: *{format_date(start_d)}*\n"
+        f"To:   *{format_date(end_d)}*\n"
+        f"No-school days added: *{added}*"
+    )
+    for chat_id in data.get("admin_chats", []):
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            await context.bot.send_message(chat_id=chat_id, text=msg_admin, parse_mode="Markdown")
         except Exception:
-            pass
-        await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "support_detail_prompt"))
+            continue
 
-        if ADMIN_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=(f"🛟 SUPPORT OPENED (seed #{tid})\nIssue: {code}\n"
-                      f"User: @{user.username or 'N/A'} ({user.id})")
-            )
+    # Notify drivers immediately (notification #1)
+    drivers = [drv for drv in data.get("drivers", {}).values() if drv.get("active", True)]
+    if drivers:
+        msg_driver = (
+            "🎉 Holiday has been set.\n\n"
+            f"📅 From: {format_date(start_d)}\n"
+            f"📅 To:   {format_date(end_d)}\n"
+            "🏫 No school during this period. No pickup needed."
+        )
+        for drv in drivers:
+            try:
+                await context.bot.send_message(chat_id=drv["id"], text=msg_driver)
+            except Exception:
+                continue
+
+    # Mark notified_on_create = True
+    holiday_ranges[-1]["notified_on_create"] = True
+    save_data(data)
+
+    await update.message.reply_text(
+        f"✅ Holiday set from {format_date(start_d)} to {format_date(end_d)}. Added {added} no-school days."
+    )
+
+
+# ---------- Test mode ----------
+
+async def test_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    data["test_mode"] = True
+    save_data(data)
+    await update.message.reply_text(
+        "🧪 Test Mode is ON. New trips will be marked as TEST and ignored in totals."
+    )
+
+
+async def test_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    data["test_mode"] = False
+    save_data(data)
+    await update.message.reply_text(
+        "✅ Test Mode is OFF. New trips will be REAL and counted in all reports."
+    )
+
+
+# ---------- Admin menu button handler ----------
+
+async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle text from admins: menu buttons + quick trip + no-school date input."""
+    data = load_data()
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not is_admin(user.id):
         return
 
-    # Offers
-    if data == "offers":
-        acts = active_offers()
-        if not acts:
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"),
-                                    InlineKeyboardMarkup([[InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")]]))
-            return
-        rows = []
-        for idx, o in enumerate(acts):
-            title = o["title_ar"] if get_state(chat_id).get("lang","ar")=="ar" else o["title_en"]
-            rows.append([InlineKeyboardButton(title, callback_data=f"offer_act|{idx}")])
-        rows.append([InlineKeyboardButton(t(chat_id, "btn_back"), callback_data="back_home")])
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_title"), InlineKeyboardMarkup(rows))
-        return
+    text = (update.message.text or "").strip()
 
-    if data.startswith("offer_act|"):
-        _, sidx = data.split("|", 1)
+    # If admin is awaiting a no-school date
+    if chat.id in data.get("awaiting_noschool_date", []):
         try:
-            idx = int(sidx)
+            d = parse_date_str(text)
         except Exception:
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
+            await update.message.reply_text("Please send date as YYYY-MM-DD.")
             return
-        acts = active_offers()
-        if idx < 0 or idx >= len(acts):
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-        off = acts[idx]
-        now = _utcnow()
-        if not (_parse_iso(off["start_at"]) <= now <= _parse_iso(off["end_at"])):
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-        lang = get_state(chat_id).get("lang", "ar")
-        title = off["title_ar"] if lang == "ar" else off["title_en"]
-        body  = off["body_ar"]  if lang == "ar" else off["body_en"]
-        # Add note that offers may change at any time (already in body)
-        text = f"🛍️ <b>{title}</b>\n\n{body}\n\n{t(chat_id, 'terms')}\n\nPlease choose a package:"
-        await safe_edit_or_send(q, context, chat_id, text, offer_packages_kb(idx), html=True)
+        # Remove from awaiting list
+        data["awaiting_noschool_date"] = [cid for cid in data["awaiting_noschool_date"] if cid != chat.id]
+        save_data(data)
+        # Reuse noschool_cmd logic
+        context.args = [format_date(d)]
+        await noschool_cmd(update, context)
+        # Return to main menu keyboard
+        await update.message.reply_text("Back to main menu.", reply_markup=admin_main_keyboard())
         return
 
-    # user chooses which package inside the selected offer
-    if data.startswith("offer_pkg|"):
-        parts = data.split("|", 2)
-        if len(parts) != 3:
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-        _, sidx, pkg_key = parts
-        try:
-            idx = int(sidx)
-        except Exception:
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-
-        acts = active_offers()
-        if idx < 0 or idx >= len(acts):
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-
-        off = acts[idx]
-        ctas: Dict[str, str] = off.get("cta_urls", {})
-        url = ctas.get(pkg_key, "")
-
-        if not url:
-            await safe_edit_or_send(q, context, chat_id, "Payment link not available for this package.", offer_packages_kb(idx))
-            return
-
-        await safe_edit_or_send(
-            q, context, chat_id, t(chat_id, "payment_instructions"),
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton(t(chat_id, "btn_pay_now"), url=url)],
-                [InlineKeyboardButton(t(chat_id, "btn_paid"), callback_data=f"offer_paid|{idx}|{pkg_key}")],
-                [InlineKeyboardButton("⬅️ Back", callback_data=f"offer_act|{idx}")]
-            ]),
-            no_preview=True
+    # Handle specific buttons
+    if text == BTN_ADD_TRIP:
+        await update.message.reply_text(
+            "To add a trip, either:\n"
+            "• Use /trip <amount> <destination>\n"
+            "• Or simply type: \"70 Dubai Mall\"",
         )
         return
 
-    # Back-compat: if old flow sends offer_agree, route to package picker
-    if data.startswith("offer_agree|"):
-        _, sidx = data.split("|", 1)
+    if text == BTN_LIST_TRIPS:
+        await list_trips_cmd(update, context)
+        return
+
+    if text == BTN_WEEKLY_REPORT:
+        await report_cmd(update, context)
+        return
+
+    if text == BTN_MONTH_REPORT:
+        await month_cmd(update, context)
+        return
+
+    if text == BTN_YEAR_REPORT:
+        await year_cmd(update, context)
+        return
+
+    if text == BTN_EXPORT_CSV:
+        await export_cmd(update, context)
+        return
+
+    if text == BTN_CLEAR_TRIPS:
+        await clear_trips_cmd(update, context)
+        return
+
+    if text == BTN_TOGGLE_TEST:
+        if load_data().get("test_mode", False):
+            await test_off_cmd(update, context)
+        else:
+            await test_on_cmd(update, context)
+        return
+
+    # No-school submenu
+    if text == BTN_NOSCHOOL_MENU:
+        await update.message.reply_text("🏫 No School Options:", reply_markup=noschool_keyboard())
+        return
+
+    if text == BTN_NOSCHOOL_TODAY:
+        context.args = ["today"]
+        await noschool_cmd(update, context)
+        return
+
+    if text == BTN_NOSCHOOL_TOMORROW:
+        context.args = ["tomorrow"]
+        await noschool_cmd(update, context)
+        return
+
+    if text == BTN_NOSCHOOL_PICKDATE:
+        # Add this chat to awaiting_noschool_date
+        if chat.id not in data["awaiting_noschool_date"]:
+            data["awaiting_noschool_date"].append(chat.id)
+            save_data(data)
+        await update.message.reply_text(
+            "📅 Send the date as YYYY-MM-DD for no school.\nExample: 2025-12-02"
+        )
+        return
+
+    # Drivers submenu
+    if text == BTN_DRIVERS_MENU:
+        await update.message.reply_text("🚕 Drivers Management:", reply_markup=drivers_keyboard())
+        return
+
+    if text == BTN_DRIVERS_LIST:
+        await update.message.reply_text(drivers_list_text(data), parse_mode="Markdown")
+        return
+
+    if text == BTN_DRIVERS_ADD:
+        await update.message.reply_text(
+            "To add a driver, use:\n/adddriver <telegram_id> <name>\nExample: /adddriver 981113059 faisal"
+        )
+        return
+
+    if text == BTN_DRIVERS_REMOVE:
+        await update.message.reply_text(
+            "To remove a driver, use:\n/removedriver <telegram_id>"
+        )
+        return
+
+    if text == BTN_DRIVERS_SET_PRIMARY:
+        await update.message.reply_text(
+            "To set primary driver, use:\n/setprimarydriver <telegram_id>"
+        )
+        return
+
+    if text == BTN_BACK_MAIN:
+        await update.message.reply_text("Back to main menu.", reply_markup=admin_main_keyboard())
+        return
+
+    # Quick trip: text like "70 dubai mall"
+    import re
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s+(.+)$", text)
+    if m:
         try:
-            idx = int(sidx)
+            amount = float(m.group(1))
+            destination = m.group(2).strip()
+        except ValueError:
+            return
+        driver = get_primary_driver(data)
+        if not driver:
+            await update.message.reply_text("No driver found. Use /adddriver first.")
+            return
+        await add_trip_common(update, context, amount, destination, driver)
+        return
+
+    # Otherwise ignore
+    return
+
+
+# ---------- Driver menu handler ----------
+
+async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_data()
+    user = update.effective_user
+    if not user or not is_driver_user(data, user.id):
+        return
+
+    text = (update.message.text or "").strip()
+    driver = data["drivers"][str(user.id)]
+
+    if text == BTN_DRIVER_MY_WEEK or text == BTN_DRIVER_MY_REPORT:
+        report_text = build_driver_weekly_report(data, driver["id"])
+        if not report_text:
+            await update.message.reply_text("No data for this week yet.")
+            return
+        await update.message.reply_text(report_text)
+        return
+
+    # Ignore other text from driver
+    return
+
+
+# ---------- Jobs ----------
+
+async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send weekly admin report every Friday 10:00."""
+    data = load_data()
+    today = today_dubai()
+    monday = today - timedelta(days=today.weekday())
+    clamped = clamp_period_to_active(monday, today, data)
+    if not clamped:
+        return
+    s, e = clamped
+    text = build_period_report(data, s, e, "📊 Weekly Driver Report")
+    for chat_id in data.get("admin_chats", []):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
         except Exception:
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
-        await safe_edit_or_send(q, context, chat_id, "Choose a package:", offer_packages_kb(idx))
+            continue
+
+
+async def sunday_preview_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Every Sunday 10:00 — prepare next week's Monday preview for admins.
+    They must confirm with /confirmdrivers to notify drivers.
+    """
+    data = load_data()
+    today = today_dubai()
+    # If today is Sunday (weekday=6)
+    if today.weekday() != 6:
         return
 
-    if data.startswith("offer_paid|"):
-        parts = data.split("|")
-        if len(parts) not in (2, 3):
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
+    next_monday = today + timedelta(days=(7 - today.weekday()) % 7 or 1)
+    # Actually: from Sunday, next Monday is tomorrow
+    if today.weekday() == 6:
+        next_monday = today + timedelta(days=1)
 
-        idx = int(parts[1]) if parts[1].isdigit() else -1
-        pkg_key = parts[2] if len(parts) == 3 else "Offer"
+    data["pending_preview_monday"] = format_date(next_monday)
+    save_data(data)
 
-        acts = active_offers()
-        if idx < 0 or idx >= len(acts):
-            await safe_edit_or_send(q, context, chat_id, t(chat_id, "offers_none"), main_menu_kb(chat_id))
-            return
+    msg = (
+        "📅 Sunday Weekly Preview\n\n"
+        f"Upcoming week starts on {format_date(next_monday)}.\n"
+        "Use /confirmdrivers to send the plan to drivers."
+    )
+    for chat_id in data.get("admin_chats", []):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception:
+            continue
 
-        ts = _now_uae().strftime("%Y-%m-%d %H:%M:%S")
-        await context.bot.send_message(chat_id=chat_id,
-                                       text=t(chat_id, "breadcrumb_paid").format(pkg=pkg_key, ts=ts))
-        set_state(chat_id, awaiting_phone=True, awaiting_phone_reason="offer")
-        await _send_phone_prompt(context, chat_id)
-        if ADMIN_CHAT_ID:
-            await context.bot.send_message(chat_id=int(ADMIN_CHAT_ID),
-                                           text=(f"🆕 Offer I Paid (phone pending)\n"
-                                                 f"User: @{user.username or 'N/A'} ({user.id})\n"
-                                                 f"Offer index: {idx}\n"
-                                                 f"Package: {pkg_key}"))
+
+async def confirmdrivers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_admin(update):
+        return
+    data = load_data()
+    monday_str = data.get("pending_preview_monday")
+    if context.args:
+        monday_str = context.args[0]
+
+    if not monday_str:
+        await update.message.reply_text("No pending preview. It will be prepared on Sunday.")
         return
 
-    # Package selection (subscribe/renew)
-    if data.startswith("pkg|"):
-        _, pkg_name = data.split("|", 1)
-        if pkg_name not in PACKAGES:
-            await safe_edit_or_send(q, context, chat_id, "Package not found.", packages_kb())
-            return
-        set_state(chat_id, package=pkg_name)
-        price = PACKAGES[pkg_name]["price_aed"]
-        await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "breadcrumb_sel").format(pkg=pkg_name, price=price))
-        lang = get_state(chat_id).get("lang", "ar")
-        details = pkg_details_for_lang(pkg_name, lang)
-        flow = get_state(chat_id).get("flow", "subscribe")
-        text = f"🛍️ <b>{pkg_name}</b>\n💰 <b>{price} AED</b>\n{details}\n{t(chat_id, 'terms')}"
-        await safe_edit_or_send(q, context, chat_id, text, agree_kb(chat_id, pkg_name, flow), html=True)
+    try:
+        monday = parse_date_str(monday_str)
+    except Exception:
+        await update.message.reply_text("Invalid Monday date stored. Set manually: /confirmdrivers YYYY-MM-DD")
         return
 
-    if data.startswith("agree|"):
-        _, reason, pkg_name = data.split("|", 2)
-        await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "breadcrumb_agree").format(pkg=pkg_name))
-        await safe_edit_or_send(q, context, chat_id, t(chat_id, "payment_instructions"), pay_kb(chat_id, pkg_name, reason), no_preview=True)
+    # Upcoming week Monday–Friday
+    start_d = monday
+    end_d = monday + timedelta(days=4)
+
+    no_school = set(data.get("no_school_dates", []))
+    school_days = [d for d in (start_d + timedelta(days=i) for i in range(5))
+                   if is_school_day(d)]
+    real_school_days = [d for d in school_days if format_date(d) not in no_school]
+
+    if not real_school_days:
+        await update.message.reply_text("Upcoming week is fully no-school/holiday. No notifications sent.")
+        data["pending_preview_monday"] = None
+        save_data(data)
         return
 
-    if data.startswith("paid|"):
-        _, reason, pkg_name = data.split("|", 2)
-        ts = _now_uae().strftime("%Y-%m-%d %H:%M:%S")
-        await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "breadcrumb_paid").format(pkg=pkg_name, ts=ts))
+    ns_days = [d for d in school_days if format_date(d) in no_school]
+    sd_str = ", ".join(format_date(d) for d in real_school_days)
+    ns_str = ", ".join(format_date(d) for d in ns_days) if ns_days else "None"
 
-        if reason == "renew":
-            set_state(chat_id, awaiting_username=True, awaiting_username_reason="renew")
-            await context.bot.send_message(chat_id=chat_id, text=t(chat_id, "ask_username"))
-        else:
-            set_state(chat_id, awaiting_phone=True, awaiting_phone_reason="subscribe")
-            await _send_phone_prompt(context, chat_id)
+    msg_driver = (
+        "📅 Upcoming school week:\n\n"
+        f"Week start: {format_date(start_d)}\n"
+        f"School days: {sd_str}\n"
+        f"No-school days: {ns_str}\n"
+        "🚗 Please be ready for pickups on school days."
+    )
 
-        if ADMIN_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=int(ADMIN_CHAT_ID),
-                text=(f"🧾 I Paid clicked\n"
-                      f"User: @{user.username or 'N/A'} (id: {user.id})\n"
-                      f"Package: {pkg_name}\n"
-                      f"Reason: {reason}\n"
-                      f"Phone: pending")
+    drivers = [drv for drv in data.get("drivers", {}).values() if drv.get("active", True)]
+    for drv in drivers:
+        try:
+            await context.bot.send_message(chat_id=drv["id"], text=msg_driver)
+        except Exception:
+            continue
+
+    data["pending_preview_monday"] = None
+    save_data(data)
+    await update.message.reply_text("✅ Weekly plan sent to all active drivers.")
+
+
+async def holiday_notification_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs daily.
+    For each holiday range:
+      - Notify drivers when created (already done in /holiday).
+      - 1 day before start -> notify drivers that holiday starts tomorrow.
+      - 1 day before end   -> notify drivers that holiday ends tomorrow (resume next day).
+    """
+    data = load_data()
+    today = today_dubai()
+    changed = False
+
+    holiday_ranges = data.get("holiday_ranges", [])
+    drivers = [d for d in data.get("drivers", {}).values() if d.get("active", True)]
+
+    for hr in holiday_ranges:
+        try:
+            start_d = parse_date_str(hr["start"])
+            end_d = parse_date_str(hr["end"])
+        except Exception:
+            continue
+
+        if "notified_on_create" not in hr:
+            hr["notified_on_create"] = True  # assume done to avoid duplicates
+        if "notified_before_start" not in hr:
+            hr["notified_before_start"] = False
+        if "notified_before_end" not in hr:
+            hr["notified_before_end"] = False
+
+        # 1 day before start
+        if not hr["notified_before_start"] and today == (start_d - timedelta(days=1)):
+            text = (
+                "🎉 Holiday starts tomorrow.\n\n"
+                f"📅 Period: {hr['start']} → {hr['end']}\n"
+                "🏫 No school during this period. No pickup needed."
             )
-        return
+            for drv in drivers:
+                try:
+                    await context.bot.send_message(chat_id=drv["id"], text=text)
+                except Exception:
+                    continue
+            hr["notified_before_start"] = True
+            changed = True
 
-    # Fallback
-    await safe_edit_or_send(q, context, chat_id, t(chat_id, "welcome"), main_menu_kb(chat_id))
+        # 1 day before end
+        if not hr["notified_before_end"] and today == (end_d - timedelta(days=1)):
+            resume_d = end_d + timedelta(days=1)
+            text = (
+                "📚 Holiday ends tomorrow.\n\n"
+                f"📅 Period: {hr['start']} → {hr['end']}\n"
+                f"🚗 Please resume pickups from {format_date(resume_d)}."
+            )
+            for drv in drivers:
+                try:
+                    await context.bot.send_message(chat_id=drv["id"], text=text)
+                except Exception:
+                    continue
+            hr["notified_before_end"] = True
+            changed = True
 
-# ------------------------- ERROR HANDLER -------------------------
-async def handle_error(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-    logging.exception("Handler error: %s", context.error)
+    if changed:
+        data["holiday_ranges"] = holiday_ranges
+        save_data(data)
 
-# ------------------------- STARTUP -------------------------
-async def _post_init(application: Application):
-    try:
-        if WEBHOOK_URL:
-            await application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-        else:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        logging.warning("Webhook init/cleanup failed: %s", e)
 
-    # Set bot commands (left-side menu)
-    try:
-        customer_commands = [
-            BotCommand("start", "Start / pick language"),
-            BotCommand("help", "Help / main menu"),
-            BotCommand("offers", "Show current offers"),
-            BotCommand("packages", "View subscription packages"),
-            BotCommand("renew", "Renew your subscription"),
-            BotCommand("trial", "Free trial request"),
-            BotCommand("support", "Support / contact us"),
-            BotCommand("info", "More info about AECyberTV"),
-            BotCommand("done", "Finish support ticket"),
-        ]
-        # Default customer menu (all users)
-        await application.bot.set_my_commands(customer_commands, scope=BotCommandScopeDefault())
+# ---------- Main ----------
 
-        # Admin menu (customer commands + admin tools) visible only in ADMIN_CHAT_ID
-        if ADMIN_CHAT_ID:
-            admin_commands = customer_commands + [
-                BotCommand("status", "Admin: bot status"),
-                BotCommand("offers_now", "Admin: active offers"),
-                BotCommand("upcoming_offers", "Admin: upcoming offers"),
-                BotCommand("offer_reload", "Admin: reload offers file"),
-                BotCommand("debug_id", "Admin: debug IDs"),
-            ]
-            await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID))
-    except Exception as e:
-        logging.warning("Failed to set bot commands: %s", e)
+def main() -> None:
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Please set BOT_TOKEN environment variable.")
 
-# ------------------------- MAIN -------------------------
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    application = Application.builder().token(token).build()
 
-    global OFFERS_ALL
-    OFFERS_ALL = build_embedded_offers()
+    # Admin & driver commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setbase", set_base))
+    application.add_handler(CommandHandler("setweekstart", set_week_start))
+    application.add_handler(CommandHandler("getweekstart", get_week_start))
+    application.add_handler(CommandHandler("adddriver", adddriver_cmd))
+    application.add_handler(CommandHandler("removedriver", removedriver_cmd))
+    application.add_handler(CommandHandler("setprimarydriver", setprimarydriver_cmd))
+    application.add_handler(CommandHandler("drivers", drivers_cmd))
+    application.add_handler(CommandHandler("trip", trip_cmd))
+    application.add_handler(CommandHandler("tripfor", tripfor_cmd))
+    application.add_handler(CommandHandler("list", list_trips_cmd))
+    application.add_handler(CommandHandler("report", report_cmd))
+    application.add_handler(CommandHandler("month", month_cmd))
+    application.add_handler(CommandHandler("year", year_cmd))
+    application.add_handler(CommandHandler("export", export_cmd))
+    application.add_handler(CommandHandler("cleartrips", clear_trips_cmd))
+    application.add_handler(CommandHandler("noschool", noschool_cmd))
+    application.add_handler(CommandHandler("holiday", holiday_cmd))
+    application.add_handler(CommandHandler("test_on", test_on_cmd))
+    application.add_handler(CommandHandler("test_off", test_off_cmd))
+    application.add_handler(CommandHandler("confirmdrivers", confirmdrivers_cmd))
 
-    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
+    # Message handlers:
+    #   - Admin menu & quick trip
+    #   - Driver buttons
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & (~filters.COMMAND),
+            admin_menu_handler,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & (~filters.COMMAND),
+            driver_menu_handler,
+        )
+    )
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("offers", offers_cmd))
-    app.add_handler(CommandHandler("packages", packages_cmd))
-    app.add_handler(CommandHandler("renew", renew_cmd))
-    app.add_handler(CommandHandler("trial", trial_cmd))
-    app.add_handler(CommandHandler("support", support_cmd))
-    app.add_handler(CommandHandler("info", info_cmd))
-    app.add_handler(CommandHandler("done", done_cmd))  # support finalize
+    # Jobs
+    jq = application.job_queue
+    # Weekly admin report – Friday
+    jq.run_daily(
+        weekly_report_job,
+        time=time(hour=10, minute=0, tzinfo=DUBAI_TZ),
+        days=(4,),  # Friday (Mon=0)
+        name="weekly_report",
+    )
+    # Sunday preview
+    jq.run_daily(
+        sunday_preview_job,
+        time=time(hour=10, minute=0, tzinfo=DUBAI_TZ),
+        days=(6,),  # Sunday
+        name="sunday_preview",
+    )
+    # Holiday reminders
+    jq.run_daily(
+        holiday_notification_job,
+        time=time(hour=9, minute=0, tzinfo=DUBAI_TZ),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="holiday_notifier",
+    )
 
-    # Admin
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("offers_now", offers_now_cmd))
-    app.add_handler(CommandHandler("upcoming_offers", upcoming_offers_cmd))
-    app.add_handler(CommandHandler("offer_reload", offer_reload_cmd))
-    app.add_handler(CommandHandler("debug_id", debug_id_cmd))
+    application.run_polling()
 
-    # Buttons
-    app.add_handler(CallbackQueryHandler(on_button))
-
-    # Messages
-    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
-
-    app.add_error_handler(handle_error)
-
-    if WEBHOOK_URL:
-        port = int(os.getenv("PORT", "10000"))
-        logging.info("Starting webhook on 0.0.0.0:%s with webhook_url=%s", port, WEBHOOK_URL)
-        app.run_webhook(listen="0.0.0.0", port=port, url_path="", webhook_url=WEBHOOK_URL, drop_pending_updates=True)
-    else:
-        logging.info("Starting polling.")
-        app.run_polling(allowed_updates=None, drop_pending_updates=True, close_loop=False)
 
 if __name__ == "__main__":
     main()

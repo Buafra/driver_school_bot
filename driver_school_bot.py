@@ -324,6 +324,18 @@ def compute_weekly_totals(
     end_date = end_dt.date()
     school_days = count_school_days_between(start_date, end_date, no_school)
 
+    # Total possible Mon–Fri school days in this period
+    total_school_weekdays = 0
+    d_iter = start_date
+    while d_iter <= end_date:
+        if d_iter.weekday() < 5:  # Mon–Fri
+            total_school_weekdays += 1
+        d_iter += timedelta(days=1)
+
+    no_school_days = total_school_weekdays - school_days
+    if no_school_days < 0:
+        no_school_days = 0
+
     base_per_day = base_weekly / SCHOOL_DAYS_PER_WEEK
     school_base_total = base_per_day * school_days
     grand_total = school_base_total + total_extra
@@ -334,6 +346,7 @@ def compute_weekly_totals(
         "base_weekly": base_weekly,
         "base_per_day": base_per_day,
         "school_days": school_days,
+        "no_school_days": no_school_days,
         "school_base_total": school_base_total,
         "grand_total": grand_total,
         "start_date": start_date,
@@ -859,6 +872,7 @@ def build_weekly_report_text(data: Dict[str, Any], start_dt: datetime, end_dt: d
         f"• Weekly base: *{totals['base_weekly']:.2f} AED*",
         f"• Base per school day (Mon–Fri): *{totals['base_per_day']:.2f} AED*",
         f"• School days in this period (excluding no-school/holidays): *{totals['school_days']}*",
+        f"• No-school / holiday days in this period: *{totals.get('no_school_days', 0)}*",
         f"• School base total: *{totals['school_base_total']:.2f} AED*",
         "",
         "🚗 Extra trips (REAL):",

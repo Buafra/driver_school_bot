@@ -937,11 +937,34 @@ async def cleartrips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # ---------- Admin: weekly / month / year ----------
 
-def format_weekly_report_body(totals: Dict[str, Any]) -> str:
+def format_weekly_report_body(data: Dict[str, Any], totals: Dict[str, Any], start_dt: datetime, end_dt: datetime) -> str:
     """
     Common weekly report text (used by admin /report and /driverview_report).
-    Matches the format you requested.
+    Matches the format you requested, and includes the
+    "Trips counted since last payment" block.
     """
+    # Determine the time window for trips since last payment
+    last_payment_ts = get_last_payment_timestamp(data)
+    if last_payment_ts is None:
+        from_dt = start_dt
+    else:
+        from_dt = last_payment_ts
+
+    # Ensure all times are in Dubai timezone for display
+    if from_dt.tzinfo is None:
+        from_dt = from_dt.replace(tzinfo=DUBAI_TZ)
+    else:
+        from_dt = from_dt.astimezone(DUBAI_TZ)
+
+    if end_dt.tzinfo is None:
+        until_dt = end_dt.replace(tzinfo=DUBAI_TZ)
+    else:
+        until_dt = end_dt.astimezone(DUBAI_TZ)
+
+    fmt = "%d-%m-%Y %I:%M %p"
+    from_str = from_dt.strftime(fmt)
+    until_str = until_dt.strftime(fmt)
+
     lines = [
         "📊 Weekly Driver Report",
         "",
@@ -957,13 +980,17 @@ def format_weekly_report_body(totals: Dict[str, Any]) -> str:
         f"• Extra total: {totals['total_extra']:.2f} AED",
         "",
         f"✅ Grand total: {totals['grand_total']:.2f} AED",
+        "",
+        "🧾 Trips counted since last payment:",
+        f"🟢 From: {from_str}",
+        f"🔵 Until: {until_str}",
     ]
     return "\n".join(lines)
 
 
 def build_weekly_report_text(data: Dict[str, Any], start_dt: datetime, end_dt: datetime) -> str:
     totals = compute_weekly_totals(data, start_dt, end_dt)
-    lines = format_weekly_report_body(totals).split("\n")
+    lines = format_weekly_report_body(data, totals, start_dt, end_dt).split("\n")
     if totals["real_trips"]:
         lines.append("")
         lines.append("📋 Trip details (REAL):")
@@ -975,6 +1002,7 @@ def build_weekly_report_text(data: Dict[str, Any], start_dt: datetime, end_dt: d
                 f"(driver {t.get('driver_id','?')})"
             )
     return "\n".join(lines)
+
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1581,7 +1609,7 @@ async def driverview_report_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     totals = compute_weekly_totals(data, start_dt, end_dt, driver_id=driver_id)
 
     # Use the same body format as the admin weekly report
-    lines = format_weekly_report_body(totals).split("\n")
+    lines = format_weekly_report_body(data, totals, start_dt, end_dt).split("\n")
     if totals["real_trips"]:
         lines.append("")
         lines.append("📋 Trip details:")
@@ -1595,18 +1623,7 @@ async def driverview_report_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
-# ---------- Menus & Text Handler ----------
-
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Smart /menu:
-    - If admin → admin keyboard
-    - If driver → driver keyboard
-    - Else → small info
-    """
-    user = update.effective_user
-    data = load_data()
-    uid = user.id if user else None
+# ---------- Menus & Text Handler ----------None
 
     if is_admin(uid):
         keyboard = [
@@ -1864,7 +1881,7 @@ def main() -> None:
         )
     )
 
-    app.run_polling()
+    app.run_polling(stop_signals=())
 
 
 if __name__ == "__main__":
@@ -3675,7 +3692,7 @@ def main() -> None:
         )
     )
 
-    app.run_polling()
+    app.run_polling(stop_signals=())
 
 
 if __name__ == "__main__":

@@ -82,11 +82,6 @@ BTN_BACK_MAIN = "⬅ Back"
 BTN_NOSCHOOL_TODAY = "🏫 No School Today"
 BTN_NOSCHOOL_TOMORROW = "🏫 No School Tomorrow"
 BTN_NOSCHOOL_PICKDATE = "📅 No School (Pick Date)"
-BTN_CLEAR_NOSCHOOL = "🗑 Clear All No-School Days"
-BTN_RESET_WEEKSTART = "🗓 Reset Weekly Start"
-BTN_FULL_RESET = "🔥 Full Reset"
-BTN_PAYMENT = "💵 Payment"
-
 
 # Driver menu buttons
 DRV_BTN_SUMMARY = "📦 My Week"
@@ -574,22 +569,9 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             save_data(data)
             await update.message.reply_text(f"✅ Updated driver {did} name to '{name}'.")
             return
-
-    # New driver
     data["drivers"].append({"id": did, "name": name, "primary": False})
     save_data(data)
     await update.message.reply_text(f"✅ Added driver {did} ({name}).")
-
-    # Notify the driver that he has been added
-    try:
-        welcome_text = (
-            "👋 You have been added as a driver in *DriverSchoolBot*.\n"
-            "You will receive weekly reports and payment notifications here."
-        )
-        await context.bot.send_message(chat_id=did, text=welcome_text, parse_mode="Markdown")
-    except Exception:
-        # Ignore if bot cannot message the driver yet (e.g. he never started the bot)
-        pass
 
 
 async def removedriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1182,6 +1164,16 @@ async def removeschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         data["no_school_dates"].remove(d_str)
         save_data(data)
         await update.message.reply_text(f"✅ {d_str} removed from no-school days.")
+
+        # Notify all drivers that this date is now a normal school day
+        try:
+            text = (
+                f"📆 No-school day removed: {d_str}.\n"
+                "✅ School will run as normal on this date."
+            )
+            await notify_drivers(context, data, text)
+        except Exception:
+            pass
     else:
         await update.message.reply_text(f"ℹ️ {d_str} was not marked as no-school.")
 
@@ -1256,85 +1248,6 @@ async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 name=f"holiday_end_{start_d.isoformat()}_{end_d.isoformat()}",
                 data={"start": start_d.isoformat(), "end": end_d.isoformat()},
             )
-
-
-
-
-# ---------- Clear helpers & reset ----------
-
-async def clear_all_noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Clear all no-school / holiday days and notify drivers.
-    """
-    if not await ensure_admin(update):
-        return
-    data = load_data()
-    count = len(data.get("no_school_dates", []))
-    data["no_school_dates"] = []
-    save_data(data)
-    await update.message.reply_text(f"🗑 Cleared all no-school / holiday days. Removed {count} dates.")
-
-    # Notify all drivers that schedule is back to normal
-    if count > 0:
-        try:
-            await notify_drivers(
-                context,
-                data,
-                "📅 All no-school / holiday days have been cleared.\n✅ Please resume the normal school schedule.",
-            )
-        except Exception:
-            pass
-
-
-async def reset_weekstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Reset weekly_start_date so reports start from the current week automatically.
-    """
-    if not await ensure_admin(update):
-        return
-    data = load_data()
-    data["weekly_start_date"] = None
-    save_data(data)
-    await update.message.reply_text("🗓 Weekly start date reset. Reports will use the current week automatically.")
-
-
-async def fullreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Full reset of dynamic data:
-    - Trips
-    - Next trip id
-    - No-school / holiday days
-    - Payments
-    - Test mode OFF
-    - Weekly start cleared
-
-    Drivers and base_weekly are kept.
-    """
-    if not await ensure_admin(update):
-        return
-    data = load_data()
-    trips_count = len(data.get("trips", []))
-    noschool_count = len(data.get("no_school_dates", []))
-    payments_count = len(data.get("payments", []))
-
-    data["trips"] = []
-    data["next_trip_id"] = 1
-    data["no_school_dates"] = []
-    data["payments"] = []
-    data["test_mode"] = False
-    data["weekly_start_date"] = None
-
-    save_data(data)
-
-    msg = (
-        "🔥 *Full reset completed*\n"
-        f"• Trips cleared: {trips_count}\n"
-        f"• No-school / holiday days cleared: {noschool_count}\n"
-        f"• Payments cleared: {payments_count}\n"
-        "Drivers and base weekly amount are kept."
-    )
-    if update.message:
-        await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 
@@ -1523,7 +1436,6 @@ async def driverview_report_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         f"• Weekly base: *{totals['base_weekly']:.2f} AED*",
         f"• Base per school day: *{totals['base_per_day']:.2f} AED*",
         f"• School days (excluding no-school): *{totals['school_days']}*",
-        f"• No-school / holiday days this week: *{totals.get('no_school_days', 0)}*",
         f"• School base total: *{totals['school_base_total']:.2f} AED*",
         "",
         "🚗 Your extra trips (REAL):",
@@ -1560,7 +1472,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = [
             [KeyboardButton(BTN_ADD_TRIP), KeyboardButton(BTN_LIST)],
             [KeyboardButton(BTN_REPORT), KeyboardButton(BTN_MONTH), KeyboardButton(BTN_YEAR)],
-            [KeyboardButton(BTN_NOSCHOOL), KeyboardButton(BTN_EXPORT), KeyboardButton(BTN_PAYMENT)],
+            [KeyboardButton(BTN_NOSCHOOL), KeyboardButton(BTN_EXPORT)],
             [KeyboardButton(BTN_CLEAR_TRIPS), KeyboardButton(BTN_TEST_TOGGLE)],
             [KeyboardButton(BTN_DRIVERS)],
         ]
@@ -1627,7 +1539,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             keyboard = [
                 [KeyboardButton(BTN_NOSCHOOL_TODAY), KeyboardButton(BTN_NOSCHOOL_TOMORROW)],
                 [KeyboardButton(BTN_NOSCHOOL_PICKDATE), KeyboardButton(BTN_BACK_MAIN)],
-                [KeyboardButton(BTN_CLEAR_NOSCHOOL)],
             ]
             markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             await update.message.reply_text("🏫 No school options:", reply_markup=markup)
@@ -1650,10 +1561,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
 
-        if text == BTN_CLEAR_NOSCHOOL:
-            await clear_all_noschool_cmd(update, context)
-            return
-
         # If we are waiting for a no-school date, try to parse this text as the date
         if context.user_data.get("await_noschool_date"):
             context.user_data["await_noschool_date"] = False
@@ -1674,17 +1581,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await test_off_cmd(update, context)
             else:
                 await test_on_cmd(update, context)
-            return
-        if text == BTN_RESET_WEEKSTART:
-            await reset_weekstart_cmd(update, context)
-            return
-        if text == BTN_FULL_RESET:
-            await fullreset_cmd(update, context)
-            return
-        if text == BTN_PAYMENT:
-            # Trigger /paid with computed amount for this week
-            context.args = []
-            await paid_cmd(update, context)
             return
 
         # ---- Drivers sub-menu ----
@@ -1783,9 +1679,6 @@ def main() -> None:
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(CommandHandler("cleartrips", cleartrips_cmd))
-    app.add_handler(CommandHandler("resetweekstart", reset_weekstart_cmd))
-    app.add_handler(CommandHandler("clear_noschool_all", clear_all_noschool_cmd))
-    app.add_handler(CommandHandler("fullreset", fullreset_cmd))
 
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("month", month_cmd))

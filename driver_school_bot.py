@@ -574,9 +574,22 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             save_data(data)
             await update.message.reply_text(f"✅ Updated driver {did} name to '{name}'.")
             return
+
+    # New driver
     data["drivers"].append({"id": did, "name": name, "primary": False})
     save_data(data)
     await update.message.reply_text(f"✅ Added driver {did} ({name}).")
+
+    # Notify the driver that he has been added
+    try:
+        welcome_text = (
+            "👋 You have been added as a driver in *DriverSchoolBot*.\n"
+            "You will receive weekly reports and payment notifications here."
+        )
+        await context.bot.send_message(chat_id=did, text=welcome_text, parse_mode="Markdown")
+    except Exception:
+        # Ignore if bot cannot message the driver yet (e.g. he never started the bot)
+        pass
 
 
 async def removedriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1251,7 +1264,7 @@ async def holiday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def clear_all_noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Clear all no-school / holiday days.
+    Clear all no-school / holiday days and notify drivers.
     """
     if not await ensure_admin(update):
         return
@@ -1260,6 +1273,17 @@ async def clear_all_noschool_cmd(update: Update, context: ContextTypes.DEFAULT_T
     data["no_school_dates"] = []
     save_data(data)
     await update.message.reply_text(f"🗑 Cleared all no-school / holiday days. Removed {count} dates.")
+
+    # Notify all drivers that schedule is back to normal
+    if count > 0:
+        try:
+            await notify_drivers(
+                context,
+                data,
+                "📅 All no-school / holiday days have been cleared.\n✅ Please resume the normal school schedule.",
+            )
+        except Exception:
+            pass
 
 
 async def reset_weekstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

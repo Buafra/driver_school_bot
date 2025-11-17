@@ -163,6 +163,26 @@ def parse_date_str(s: str) -> date:
 def today_dubai() -> date:
     return datetime.now(DUBAI_TZ).date()
 
+def get_last_payment_timestamp(data: Dict[str, Any]) -> Optional[datetime]:
+    """
+    Returns the timestamp of the last /paid record, or None if no payments yet.
+    Used so that any trips after the last payment are counted in the *next* report.
+    """
+    payments = data.get("payments") or []
+    latest: Optional[datetime] = None
+    for p in payments:
+        ts = p.get("timestamp")
+        if not ts:
+            continue
+        try:
+            dt = parse_iso_datetime(ts)
+        except Exception:
+            continue
+        if latest is None or dt > latest:
+            latest = dt
+    return latest
+
+
 
 def clamp_start_by_weekstart(data: Dict[str, Any], start_date: date) -> Optional[date]:
     """
@@ -337,10 +357,14 @@ def compute_weekly_totals(
     all_trips = data["trips"]
     floor_str = data.get("weekly_start_date")
     floor_date = parse_date_str(floor_str) if floor_str else None
+    last_payment_ts = get_last_payment_timestamp(data)
 
     trips: List[Dict[str, Any]] = []
     for t in all_trips:
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        # Skip trips that were already covered by a previous /paid
+        if last_payment_ts and dt <= last_payment_ts:
+            continue
         d = dt.date()
         if floor_date and d < floor_date:
             continue
@@ -2140,10 +2164,14 @@ def compute_weekly_totals(
     all_trips = data["trips"]
     floor_str = data.get("weekly_start_date")
     floor_date = parse_date_str(floor_str) if floor_str else None
+    last_payment_ts = get_last_payment_timestamp(data)
 
     trips: List[Dict[str, Any]] = []
     for t in all_trips:
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        # Skip trips that were already covered by a previous /paid
+        if last_payment_ts and dt <= last_payment_ts:
+            continue
         d = dt.date()
         if floor_date and d < floor_date:
             continue

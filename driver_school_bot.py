@@ -1881,7 +1881,7 @@ def main() -> None:
         )
     )
 
-    app.run_polling()
+    app.run_polling(stop_signals=())
 
 
 if __name__ == "__main__":
@@ -3692,7 +3692,7 @@ def main() -> None:
         )
     )
 
-    app.run_polling()
+    app.run_polling(stop_signals=())
 
 
 if __name__ == "__main__":

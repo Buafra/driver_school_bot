@@ -1466,6 +1466,30 @@ async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if txt in (BTN_DRIVER_MY_WEEK, BTN_DRIVER_MY_REPORT):
         await driver_week_cmd(update, context)
 
+# ---------- AI ----------
+from openai import OpenAI
+client = OpenAI()
+
+async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.replace("/ai", "").strip()
+
+    if not user_text:
+        await update.message.reply_text(
+            "🧠 Send your question after /ai.\nExample:\n/ai explain my weekly report"
+        )
+        return
+
+    completion = client.chat.completions.create(
+        model="gpt-5.1-mini",
+        messages=[
+            {"role": "system",
+             "content": "You are an assistant for Faisal's driver bot. "
+                        "Explain things clearly and simply."},
+            {"role": "user", "content": user_text}
+        ],
+    )
+
+    await update.message.reply_text(completion.choices[0].message.content)
 
 # ---------- Main ----------
 
@@ -1503,6 +1527,7 @@ def main() -> None:
     app.add_handler(CommandHandler("noschool", noschool_cmd))
     app.add_handler(CommandHandler("removeschool", removeschool_cmd))
     app.add_handler(CommandHandler("clearnoschool", clearnoschool_cmd))
+    application.add_handler(CommandHandler("ai", ai_chat))
 
     # Text handlers
     # Admin buttons / quick trips

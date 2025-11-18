@@ -1,5 +1,5 @@
 # driver_school_bot.py
-# DriverSchoolBot 2.0 — clean version
+# DriverSchoolBot 2.0 — clean version (updated)
 #
 # Features:
 # - Admins vs drivers
@@ -8,6 +8,10 @@
 # - /paid closes all trips up to that moment
 # - Weekly report counts ONLY trips after last payment
 # - "Trips counted since last payment" block (Option C)
+# - /noschool today / tomorrow / YYYY-MM-DD
+# - No-school menu buttons + driver notifications
+# - Trip notifications to admins + driver
+# - Driver welcome message on /adddriver
 # - Simple /menu for admin & driver keyboards
 
 import os
@@ -56,6 +60,10 @@ BTN_TOGGLE_TEST = "🧪 Test Mode"
 BTN_DRIVERS_MENU = "🚕 Drivers"
 BTN_NOSCHOOL_MENU = "🏫 No School"
 BTN_PAID = "💸 Paid (Close Week)"
+
+# No-school menu buttons
+BTN_NOSCHOOL_TODAY = "🏫 No School Today"
+BTN_NOSCHOOL_TOMORROW = "🏫 No School Tomorrow"
 
 # Buttons — Drivers submenu
 BTN_DRIVERS_LIST = "🚕 List Drivers"
@@ -324,6 +332,12 @@ def format_weekly_report_body(
     """
     Shared weekly report text (admin + driver) with "Trips counted since last payment".
     """
+
+    # Period (week window)
+    start_date_str = start_dt.date().strftime("%Y-%m-%d")
+    end_date_str = end_dt.date().strftime("%Y-%m-%d")
+
+    # From / until (since last payment)
     last_payment_ts = get_last_payment_timestamp(data)
     if last_payment_ts is None:
         from_dt = start_dt
@@ -347,6 +361,7 @@ def format_weekly_report_body(
 
     lines = [
         "📊 Weekly Driver Report",
+        f"Period: {start_date_str} → {end_date_str}",
         "",
         "🎓 School base (daily):",
         f"• Weekly base: {totals['base_weekly']:.2f} AED",
@@ -455,6 +470,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• /tripfor <driver_id> <amount> <destination>\n"
             "• /report — weekly\n"
             "• /paid — close all trips up to now\n"
+            "• /noschool today|tomorrow|YYYY-MM-DD\n"
         )
         if update.message:
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_main_keyboard())
@@ -558,19 +574,40 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except ValueError:
         await update.message.reply_text("Driver Telegram ID must be a number.")
         return
+
     name = " ".join(context.args[1:])
     data = load_data()
     drivers = data["drivers"]
+
     first_driver = len(drivers) == 0
+
     drivers[str(driver_id)] = {
         "id": driver_id,
         "name": name,
         "active": True,
-        "is_primary": first_driver,
+        "is_primary": first_driver,  # first added becomes primary by default
     }
     save_data(data)
+
     flag = " (primary)" if first_driver else ""
+    # Message to admin who added
     await update.message.reply_text(f"✅ Driver added: {name} ({driver_id}){flag}")
+
+    # Try to notify the driver
+    welcome_msg = (
+        f"🚕 Hello {name}!\n\n"
+        "You have been added as a driver in *DriverSchoolBot*.\n"
+        "Use /start to open your driver menu and see your weekly report and summary."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=driver_id,
+            text=welcome_msg,
+            parse_mode="Markdown",
+        )
+    except Exception:
+        # If the driver never started the bot, Telegram will block this — just ignore.
+        pass
 
 
 async def removedriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -669,6 +706,38 @@ async def add_trip_common(
             f"💰 {amount:.2f} AED\n"
             f"🚕 Driver: {driver['name']} ({driver['id']})"
         )
+
+    # Notifications only for REAL trips
+    if not is_test:
+        # Notify admins
+        admin_msg = (
+            "🔔 New trip added:\n"
+            f"🆔 ID: {trip_id}\n"
+            f"📅 {pretty}\n"
+            f"📍 {destination}\n"
+            f"💰 {amount:.2f} AED\n"
+            f"👤 Added by Telegram ID: {trip['user_id']}\n"
+            f"🚗 For driver: {driver['name']} ({driver['id']})"
+        )
+        for chat_id in data.get("admin_chats", []):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=admin_msg)
+            except Exception:
+                continue
+
+        # Notify driver
+        driver_msg = (
+            "🚗 New extra trip recorded:\n"
+            f"🆔 ID: {trip_id}\n"
+            f"📅 {pretty}\n"
+            f"📍 {destination}\n"
+            f"💰 {amount:.2f} AED\n"
+            f"👤 Recorded by: {trip['user_name'] or trip['user_id']}"
+        )
+        try:
+            await context.bot.send_message(chat_id=driver["id"], text=driver_msg)
+        except Exception:
+            pass
 
 
 async def trip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -868,15 +937,29 @@ async def test_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update):
         return
+
     data = load_data()
-    if not context.args:
-        await update.message.reply_text("Usage: /noschool YYYY-MM-DD")
-        return
-    try:
-        d = parse_date_str(context.args[0])
-    except Exception:
-        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
-        return
+
+    # Support: /noschool          → today
+    #          /noschool today    → today
+    #          /noschool tomorrow → tomorrow
+    #          /noschool YYYY-MM-DD
+    if context.args:
+        arg = context.args[0].lower()
+    else:
+        arg = "today"
+
+    if arg == "today":
+        d = today_dubai()
+    elif arg == "tomorrow":
+        d = today_dubai() + timedelta(days=1)
+    else:
+        try:
+            d = parse_date_str(context.args[0])
+        except Exception:
+            await update.message.reply_text("Invalid date. Use: today, tomorrow, or YYYY-MM-DD.")
+            return
+
     d_str = format_date(d)
     if d_str not in data["no_school_dates"]:
         data["no_school_dates"].append(d_str)
@@ -885,6 +968,16 @@ async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"✅ Marked {d_str} as no-school day.")
     else:
         await update.message.reply_text(f"ℹ️ {d_str} is already no-school.")
+
+    # Notify drivers about this no-school date
+    drivers = [drv for drv in data.get("drivers", {}).values() if drv.get("active", True)]
+    if drivers:
+        msg = f"🏫 No school on {d_str}. No pickup needed that day."
+        for drv in drivers:
+            try:
+                await context.bot.send_message(chat_id=drv["id"], text=msg)
+            except Exception:
+                continue
 
 
 # ---------- Menu handlers ----------
@@ -940,13 +1033,24 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Use /setprimarydriver <telegram_id>")
         return
     if txt == BTN_NOSCHOOL_MENU:
-        await update.message.reply_text("🏫 No School:", reply_markup=ReplyKeyboardMarkup(
-            [
-                [KeyboardButton("🏫 No School Today"), KeyboardButton("🏫 No School Tomorrow")],
-                [KeyboardButton(BTN_BACK_MAIN)],
-            ],
-            resize_keyboard=True,
-        ))
+        await update.message.reply_text(
+            "🏫 No School:",
+            reply_markup=ReplyKeyboardMarkup(
+                [
+                    [KeyboardButton(BTN_NOSCHOOL_TODAY), KeyboardButton(BTN_NOSCHOOL_TOMORROW)],
+                    [KeyboardButton(BTN_BACK_MAIN)],
+                ],
+                resize_keyboard=True,
+            ),
+        )
+        return
+    if txt == BTN_NOSCHOOL_TODAY:
+        context.args = ["today"]
+        await noschool_cmd(update, context)
+        return
+    if txt == BTN_NOSCHOOL_TOMORROW:
+        context.args = ["tomorrow"]
+        await noschool_cmd(update, context)
         return
     if txt == BTN_BACK_MAIN:
         await update.message.reply_text("Back to main menu.", reply_markup=admin_main_keyboard())

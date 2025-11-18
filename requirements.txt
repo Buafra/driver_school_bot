@@ -1,3 +1,2 @@
 python-telegram-bot[job-queue]==21.4
-openai>=1.53
-# (other packages you already have)
+

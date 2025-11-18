@@ -1466,48 +1466,6 @@ async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if txt in (BTN_DRIVER_MY_WEEK, BTN_DRIVER_MY_REPORT):
         await driver_week_cmd(update, context)
 
-# ---------- AI ----------
-# ---------- AI ----------
-from openai import OpenAI
-import os
-import logging
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.replace("/ai", "").strip()
-
-    if not user_text:
-        await update.message.reply_text(
-            "🧠 Send your question after /ai.\nExample:\n/ai explain my weekly report"
-        )
-        return
-
-    try:
-        completion = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an assistant for Faisal's driver bot. "
-                        "Explain things clearly and simply."
-                    ),
-                },
-                {"role": "user", "content": user_text},
-            ],
-        )
-
-        reply = completion.choices[0].message.content
-        await update.message.reply_text(reply)
-
-    except Exception as e:
-        logging.exception("AI error")
-        await update.message.reply_text(
-            f"⚠️ AI is not working right now.\nError: {e}"
-        )
-
-
 # ---------- Main ----------
 
 def main() -> None:
@@ -1545,9 +1503,6 @@ def main() -> None:
     app.add_handler(CommandHandler("removeschool", removeschool_cmd))
     app.add_handler(CommandHandler("clearnoschool", clearnoschool_cmd))
 
-    # ✅ AI command – use `app`, not `application`
-    app.add_handler(CommandHandler("ai", ai_chat))
-
     # Text handlers
     # Admin buttons / quick trips
     app.add_handler(
@@ -1570,3 +1525,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

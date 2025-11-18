@@ -1,5 +1,5 @@
 # driver_school_bot.py
-# DriverSchoolBot 2.0 — with /paid, driver weekly report, and no-school pick date
+# DriverSchoolBot 2.0 — with /paid, driver weekly report, and no-school pick/remove/clear
 #
 # Features:
 # - Admins vs drivers
@@ -9,7 +9,9 @@
 # - Weekly report counts ONLY trips after last payment
 # - Driver weekly report (buttons: 📦 My Week / 🧾 My Weekly Report)
 # - /noschool today|tomorrow|YYYY-MM-DD + button for pick date
-# - No-school notifications to all drivers
+# - /removeschool YYYY-MM-DD to remove a single no-school date (no driver notification)
+# - /clearnoschool to clear ALL no-school dates (drivers notified)
+# - No-school notifications when adding new no-school day
 # - Trip notifications to admins + target driver
 # - Driver welcome message on /adddriver
 # - /menu for admin & driver keyboards
@@ -66,13 +68,13 @@ BTN_PAID = "💸 Paid (Close Week)"
 BTN_NOSCHOOL_TODAY = "🏫 No School Today"
 BTN_NOSCHOOL_TOMORROW = "🏫 No School Tomorrow"
 BTN_NOSCHOOL_PICKDATE = "📅 No School (Pick Date)"
+BTN_BACK_MAIN = "⬅ Back"
 
 # Buttons — Drivers submenu
 BTN_DRIVERS_LIST = "🚕 List Drivers"
 BTN_DRIVERS_ADD = "➕ Add Driver"
 BTN_DRIVERS_REMOVE = "🗑 Remove Driver"
 BTN_DRIVERS_SET_PRIMARY = "⭐ Set Primary Driver"
-BTN_BACK_MAIN = "⬅ Back"
 
 # Buttons — Driver menu (for drivers themselves)
 BTN_DRIVER_MY_WEEK = "📦 My Week"
@@ -236,7 +238,7 @@ def get_last_payment_timestamp(data: Dict[str, Any]) -> Optional[datetime]:
 
 def weekly_range_now(data: Dict[str, Any]) -> Tuple[Optional[datetime], datetime]:
     """
-    Get (start_of_week, end_of_week) for weekly report, respecting week_start_date.
+    Get (start_of_week_for_calc, end_for_calc) for weekly report, respecting week_start_date.
 
     - If week_start_date is set and not in the future, weeks are 7-day blocks.
     - If week_start_date is future, return (None, now).
@@ -260,13 +262,13 @@ def weekly_range_now(data: Dict[str, Any]) -> Tuple[Optional[datetime], datetime
         # Calendar Monday
         week_start = today - timedelta(days=today.weekday())
 
-    # Week ends on Friday, capped to today
-    week_end_date = week_start + timedelta(days=4)
-    if week_end_date > today:
-        week_end_date = today
+    # For calculations: end is min(week_start+4, today)
+    calc_end_date = week_start + timedelta(days=4)
+    if calc_end_date > today:
+        calc_end_date = today
 
     start_dt = datetime(week_start.year, week_start.month, week_start.day, 0, 0, tzinfo=DUBAI_TZ)
-    end_dt = datetime(week_end_date.year, week_end_date.month, week_end_date.day, 23, 59, 59, tzinfo=DUBAI_TZ)
+    end_dt = datetime(calc_end_date.year, calc_end_date.month, calc_end_date.day, 23, 59, 59, tzinfo=DUBAI_TZ)
     return start_dt, end_dt
 
 
@@ -334,12 +336,17 @@ def format_weekly_report_body(
     end_dt: datetime
 ) -> str:
     """
-    Shared weekly report text (admin + driver) with "Trips counted since last payment".
+    Shared weekly report text (admin + driver):
+
+    - Period label: ALWAYS full week Mon–Fri (week_start → week_start+4)
+    - Calculations: only up to end_dt (capped by today).
     """
 
-    # Period (week window)
-    start_date_str = start_dt.date().strftime("%Y-%m-%d")
-    end_date_str = end_dt.date().strftime("%Y-%m-%d")
+    # Label period: full school week based on start_dt
+    week_start_d = start_dt.date()
+    week_end_d = week_start_d + timedelta(days=4)
+    start_date_str = week_start_d.strftime("%Y-%m-%d")
+    end_date_str = week_end_d.strftime("%Y-%m-%d")
 
     # From / until (since last payment)
     last_payment_ts = get_last_payment_timestamp(data)
@@ -484,6 +491,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• /report — weekly\n"
             "• /paid — close all trips up to now\n"
             "• /noschool today|tomorrow|YYYY-MM-DD\n"
+            "• /removeschool YYYY-MM-DD\n"
+            "• /clearnoschool\n"
         )
         if update.message:
             await update.message.reply_text(msg, reply_markup=admin_main_keyboard())
@@ -996,6 +1005,66 @@ async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 continue
 
 
+async def removeschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /removeschool YYYY-MM-DD
+    Remove one no-school date. No driver notification.
+    """
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /removeschool YYYY-MM-DD")
+        return
+    try:
+        d = parse_date_str(context.args[0])
+    except Exception:
+        await update.message.reply_text("Invalid date. Use YYYY-MM-DD.")
+        return
+
+    d_str = format_date(d)
+    data = load_data()
+    if d_str in data["no_school_dates"]:
+        data["no_school_dates"] = [x for x in data["no_school_dates"] if x != d_str]
+        save_data(data)
+        await update.message.reply_text(f"✅ {d_str} removed from no-school dates.")
+    else:
+        await update.message.reply_text(f"ℹ️ {d_str} was not in no-school dates.")
+
+
+async def clearnoschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /clearnoschool
+    Clear ALL no-school dates and notify drivers that schedule is back to normal.
+    """
+    if not await ensure_admin(update):
+        return
+
+    data = load_data()
+    existing = data.get("no_school_dates", [])
+    if not existing:
+        await update.message.reply_text("ℹ️ There are no no-school dates to clear.")
+        return
+
+    count = len(existing)
+    data["no_school_dates"] = []
+    save_data(data)
+
+    await update.message.reply_text(f"✅ All no-school dates cleared. ({count} days removed)")
+
+    # Notify drivers
+    drivers = [drv for drv in data.get("drivers", {}).values() if drv.get("active", True)]
+    if drivers:
+        msg = (
+            "📚 All previous no-school days were cleared.\n"
+            "🚗 Please follow the normal school schedule."
+        )
+        for drv in drivers:
+            try:
+                await context.bot.send_message(chat_id=drv["id"], text=msg)
+            except Exception:
+                continue
+
+
 # ---------- Menu handlers ----------
 
 async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1125,10 +1194,6 @@ async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await driver_week_cmd(update, context)
 
 
-# ---------- Jobs (optional, if you want to add later) ----------
-# For now, no scheduled jobs — reports are manual (/report, /paid)
-
-
 # ---------- Main ----------
 
 def main() -> None:
@@ -1160,6 +1225,8 @@ def main() -> None:
     app.add_handler(CommandHandler("test_on", test_on_cmd))
     app.add_handler(CommandHandler("test_off", test_off_cmd))
     app.add_handler(CommandHandler("noschool", noschool_cmd))
+    app.add_handler(CommandHandler("removeschool", removeschool_cmd))
+    app.add_handler(CommandHandler("clearnoschool", clearnoschool_cmd))
 
     # Text handlers
     # Admin buttons / quick trips

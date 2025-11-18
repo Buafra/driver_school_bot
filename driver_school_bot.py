@@ -1,21 +1,26 @@
 # driver_school_bot.py
-# DriverSchoolBot 2.0 — with /paid, driver weekly report, and no-school pick/remove/clear
+# DriverSchoolBot 3.0 — multi-driver, per-driver base, per-driver payments, short IDs
 #
 # Features:
 # - Admins vs drivers
+# - Multiple drivers; each has:
+#       - telegram_id (long)
+#       - short_id (small int, e.g. 1,2,3…)
+#       - base_weekly (own weekly base, or fallback to global)
+#       - payments (list of payment timestamps)
 # - Weekly school base with /setbase and /setweekstart
 # - Extra trips (REAL vs TEST)
-# - /paid closes all trips up to now
-# - Weekly report counts ONLY trips after last payment
-# - Driver weekly report (buttons: 📦 My Week / 🧾 My Weekly Report)
-# - /noschool today|tomorrow|YYYY-MM-DD + button for pick date
-# - /removeschool YYYY-MM-DD to remove a single no-school date (no driver notification)
-# - /clearnoschool to clear ALL no-school dates (drivers notified)
-# - No-school notifications when adding new no-school day
-# - Trip notifications to admins + target driver
-# - Driver welcome message on /adddriver
-# - /menu for admin & driver keyboards
-# - No Markdown parsing (no entity errors)
+# - /paydriver <driver_code> → close trips for one driver
+# - /paid → close trips for ALL drivers
+# - Weekly report:
+#       - Admin: totals for all drivers, ignoring already-paid trips
+#       - Driver: own base + own trips since last payment
+# - /setdriverbase <driver_code> <amount>
+# - /noschool, /removeschool, /clearnoschool + notifications
+# - Short ID usable in commands: /tripfor, /paydriver, /setdriverbase, /removedriver, /setprimarydriver
+# - /listunpaid <driver_code> → unpaid trips for one driver
+# - /menu shows correct keyboard for admin / driver
+# - No Markdown parse issues (plain text messages)
 
 import os
 import json
@@ -62,7 +67,7 @@ BTN_CLEAR_TRIPS = "🧹 Clear All Trips"
 BTN_TOGGLE_TEST = "🧪 Test Mode"
 BTN_DRIVERS_MENU = "🚕 Drivers"
 BTN_NOSCHOOL_MENU = "🏫 No School"
-BTN_PAID = "💸 Paid (Close Week)"
+BTN_PAID = "💸 Paid (All Drivers)"
 
 # No-school menu buttons
 BTN_NOSCHOOL_TODAY = "🏫 No School Today"
@@ -104,8 +109,16 @@ def load_data() -> Dict[str, Any]:
     data.setdefault("drivers", {})                # {str(telegram_id): {...}}
     data.setdefault("admin_chats", [])            # list of chat_ids
     data.setdefault("test_mode", False)
-    data.setdefault("payments", [])               # list of {"timestamp": iso, "note": str}
     data.setdefault("awaiting_noschool_date", []) # list of admin chat_ids awaiting date
+
+    # Upgrade old driver structure with new fields
+    drivers = data["drivers"]
+    for drv in drivers.values():
+        drv.setdefault("active", True)
+        drv.setdefault("is_primary", False)
+        drv.setdefault("base_weekly", None)   # per-driver base; None -> use global
+        drv.setdefault("payments", [])        # list of ISO timestamps
+        drv.setdefault("short_id", None)      # small int
 
     return data
 
@@ -161,6 +174,41 @@ async def ensure_admin(update: Update) -> bool:
 
 # ---------- Driver helpers ----------
 
+def get_driver_by_telegram_id(data: Dict[str, Any], telegram_id: int) -> Optional[Dict[str, Any]]:
+    return data.get("drivers", {}).get(str(telegram_id))
+
+
+def get_next_short_driver_id(data: Dict[str, Any]) -> int:
+    drivers = data.get("drivers", {})
+    max_sid = 0
+    for d in drivers.values():
+        sid = d.get("short_id")
+        if isinstance(sid, int) and sid > max_sid:
+            max_sid = sid
+    return max_sid + 1
+
+
+def get_driver_by_any_id(data: Dict[str, Any], code: int) -> Optional[Dict[str, Any]]:
+    """
+    code can be:
+    - Telegram ID (key in data['drivers'])
+    - short_id (small int)
+    """
+    drivers = data.get("drivers", {})
+
+    # 1) Try as Telegram ID key
+    drv = drivers.get(str(code))
+    if drv:
+        return drv
+
+    # 2) Try as short_id
+    for d in drivers.values():
+        if d.get("short_id") == code:
+            return d
+
+    return None
+
+
 def get_primary_driver(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     drivers = data.get("drivers", {})
     for d in drivers.values():
@@ -172,10 +220,6 @@ def get_primary_driver(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_driver_by_id(data: Dict[str, Any], driver_id: int) -> Optional[Dict[str, Any]]:
-    return data.get("drivers", {}).get(str(driver_id))
-
-
 def drivers_list_text(data: Dict[str, Any]) -> str:
     drivers = data.get("drivers", {})
     if not drivers:
@@ -184,13 +228,51 @@ def drivers_list_text(data: Dict[str, Any]) -> str:
     for d in drivers.values():
         flag = "⭐ Primary" if d.get("is_primary", False) else ""
         active = "✅ Active" if d.get("active", True) else "❌ Inactive"
+        sid = d.get("short_id")
+        base = d.get("base_weekly")
+        base_str = f"{base:.2f} AED" if base else "default"
         lines.append(
-            f"- ID: {d['id']} — {d['name']} ({active}) {flag}"
+            f"- Name: {d['name']} | ID: {d['id']} | SID: {sid} | Base: {base_str} | {active} {flag}"
         )
     return "\n".join(lines)
 
 
-# ---------- School days & payments ----------
+def get_driver_base_weekly(data: Dict[str, Any], driver_id: int) -> float:
+    d = get_driver_by_telegram_id(data, driver_id) or get_driver_by_any_id(data, driver_id)
+    if d and d.get("base_weekly") not in (None, 0):
+        return float(d["base_weekly"])
+    return float(data.get("base_weekly", DEFAULT_BASE_WEEKLY))
+
+
+def get_total_base_weekly_all_drivers(data: Dict[str, Any]) -> float:
+    total = 0.0
+    drivers = data.get("drivers", {})
+    for d in drivers.values():
+        if not d.get("active", True):
+            continue
+        base = d.get("base_weekly")
+        if base in (None, 0):
+            base = data.get("base_weekly", DEFAULT_BASE_WEEKLY)
+        total += float(base)
+    return total
+
+
+def get_last_payment_for_driver(data: Dict[str, Any], driver_id: int) -> Optional[datetime]:
+    drv = get_driver_by_telegram_id(data, driver_id) or get_driver_by_any_id(data, driver_id)
+    if not drv:
+        return None
+    last_dt = None
+    for ts in drv.get("payments", []):
+        try:
+            dt = parse_iso_datetime(ts)
+        except Exception:
+            continue
+        if last_dt is None or dt > last_dt:
+            last_dt = dt
+    return last_dt
+
+
+# ---------- School days & week ranges ----------
 
 def is_school_day(d: date) -> bool:
     # Monday=0 .. Sunday=6
@@ -215,34 +297,13 @@ def school_days_between(start_d: date, end_d: date, no_school_dates: List[str]) 
     return school, noschool
 
 
-def get_last_payment_timestamp(data: Dict[str, Any]) -> Optional[datetime]:
-    """
-    Returns the timestamp of the last /paid record, or None if no payments yet.
-    """
-    payments = data.get("payments") or []
-    latest: Optional[datetime] = None
-    for p in payments:
-        ts = p.get("timestamp")
-        if not ts:
-            continue
-        try:
-            dt = parse_iso_datetime(ts)
-        except Exception:
-            continue
-        if latest is None or dt > latest:
-            latest = dt
-    return latest
-
-
-# ---------- Weekly range & totals ----------
-
 def weekly_range_now(data: Dict[str, Any]) -> Tuple[Optional[datetime], datetime]:
     """
     Get (start_of_week_for_calc, end_for_calc) for weekly report, respecting week_start_date.
 
     - If week_start_date is set and not in the future, weeks are 7-day blocks.
-    - If week_start_date is future, return (None, now).
-    - If not set, use current calendar week Monday–Friday.
+    - If week_start_date is in the future, return (None, now).
+    - If no week_start_date, use current calendar Monday.
     """
     now = now_dubai()
     today = now.date()
@@ -272,49 +333,66 @@ def weekly_range_now(data: Dict[str, Any]) -> Tuple[Optional[datetime], datetime
     return start_dt, end_dt
 
 
+# ---------- Weekly totals ----------
+
 def compute_weekly_totals(
     data: Dict[str, Any],
     start_dt: datetime,
     end_dt: datetime,
     driver_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    base_weekly = data["base_weekly"]
-    base_per_day = base_weekly / SCHOOL_DAYS_PER_WEEK
     no_school_dates = data["no_school_dates"]
     all_trips = data["trips"]
 
     start_d = start_dt.date()
     end_d = end_dt.date()
     school_days, noschool_days = school_days_between(start_d, end_d, no_school_dates)
+
+    if driver_id is not None:
+        # Per-driver base + payment
+        base_weekly = get_driver_base_weekly(data, driver_id)
+        last_payment_ts = get_last_payment_for_driver(data, driver_id)
+    else:
+        # Global base = sum of all active drivers
+        base_weekly = get_total_base_weekly_all_drivers(data)
+        last_payment_ts = None  # per-trip, see below
+
+    base_per_day = base_weekly / SCHOOL_DAYS_PER_WEEK
     school_base_total = base_per_day * school_days
 
-    floor_str = data.get("week_start_date")
-    floor_date = parse_date_str(floor_str) if floor_str else None
-    last_payment_ts = get_last_payment_timestamp(data)
-
-    trips: List[Dict[str, Any]] = []
+    real_trips: List[Dict[str, Any]] = []
     for t in all_trips:
         try:
             dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         except Exception:
             continue
 
-        # Skip trips already paid
-        if last_payment_ts and dt <= last_payment_ts:
-            continue
-
         d = dt.date()
-        if floor_date and d < floor_date:
-            continue
-        if dt < start_dt or dt > end_dt:
+        if d < start_d or d > end_d:
             continue
         if t.get("is_test", False):
             continue
-        if driver_id is not None and t.get("driver_id") != driver_id:
-            continue
-        trips.append(t)
 
-    total_extra = sum(t["amount"] for t in trips)
+        trip_driver_id = t.get("driver_id")
+
+        if driver_id is not None:
+            # Single driver: filter by his ID and his own payments
+            if trip_driver_id != driver_id:
+                continue
+            lp = last_payment_ts
+            if lp and dt <= lp:
+                continue
+        else:
+            # Admin global: filter by each trip's own driver's payments
+            if trip_driver_id is None:
+                continue
+            lp = get_last_payment_for_driver(data, trip_driver_id)
+            if lp and dt <= lp:
+                continue
+
+        real_trips.append(t)
+
+    total_extra = sum(t["amount"] for t in real_trips)
     grand_total = school_base_total + total_extra
 
     return {
@@ -323,56 +401,112 @@ def compute_weekly_totals(
         "school_days": school_days,
         "no_school_days": noschool_days,
         "school_base_total": school_base_total,
-        "real_trips": trips,
+        "real_trips": real_trips,
         "total_extra": total_extra,
         "grand_total": grand_total,
+        "last_payment_ts": last_payment_ts,
+        "end_ts": end_dt,
     }
 
 
-def format_weekly_report_body(
-    data: Dict[str, Any],
-    totals: Dict[str, Any],
-    start_dt: datetime,
-    end_dt: datetime
-) -> str:
+def format_period_header(start_dt: datetime) -> str:
     """
-    Shared weekly report text (admin + driver):
-
-    - Period label: ALWAYS full week Mon–Fri (week_start → week_start+4)
-    - Calculations: only up to end_dt (capped by today).
+    For header label: always full week Monday–Friday.
     """
-
-    # Label period: full school week based on start_dt
     week_start_d = start_dt.date()
     week_end_d = week_start_d + timedelta(days=4)
-    start_date_str = week_start_d.strftime("%Y-%m-%d")
-    end_date_str = week_end_d.strftime("%Y-%m-%d")
+    return f"Period: {week_start_d.strftime('%Y-%m-%d')} → {week_end_d.strftime('%Y-%m-%d')}"
 
-    # From / until (since last payment)
-    last_payment_ts = get_last_payment_timestamp(data)
-    if last_payment_ts is None:
+
+def build_admin_weekly_report_text(data: Dict[str, Any], start_dt: datetime, end_dt: datetime) -> str:
+    totals = compute_weekly_totals(data, start_dt, end_dt, driver_id=None)
+    header = format_period_header(start_dt)
+    lines = [
+        "📊 Weekly Driver Report (ALL drivers)",
+        header,
+        "",
+        "🎓 School base (daily):",
+        f"• Weekly base total for all drivers: {totals['base_weekly']:.2f} AED",
+        f"• Base per school day (Mon–Fri): {totals['base_per_day']:.2f} AED",
+        f"• School days in this period : {totals['school_days']}",
+        f"• No-school / holiday days in this period: {totals['no_school_days']}",
+        f"• School base total: {totals['school_base_total']:.2f} AED",
+        "",
+        "🚗 Extra trips (REAL, unpaid):",
+        f"• Count: {len(totals['real_trips'])}",
+        f"• Extra total: {totals['total_extra']:.2f} AED",
+        "",
+        f"✅ Grand total (base + unpaid trips): {totals['grand_total']:.2f} AED",
+        "",
+        "ℹ️ Trips already paid for each driver (via /paydriver or /paid) are not included here.",
+    ]
+
+    # Per-driver extra totals
+    if totals["real_trips"]:
+        lines.append("")
+        lines.append("🚕 Extra trips per driver (unpaid):")
+        drivers = data.get("drivers", {})
+        extra_by_driver: Dict[str, float] = {}
+        for t in totals["real_trips"]:
+            did = str(t.get("driver_id"))
+            extra_by_driver[did] = extra_by_driver.get(did, 0.0) + t["amount"]
+        for did, amount in extra_by_driver.items():
+            d = drivers.get(did)
+            if d:
+                name = d["name"]
+                sid = d.get("short_id")
+                lines.append(f"- {name} (ID: {d['id']}, SID: {sid}): {amount:.2f} AED")
+            else:
+                lines.append(f"- Driver {did}: {amount:.2f} AED")
+
+        lines.append("")
+        lines.append("📋 Trip details:")
+        for t in sorted(totals["real_trips"], key=lambda x: x["id"]):
+            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+            d_str = dt.strftime("%Y-%m-%d")
+            drivers = data.get("drivers", {})
+            d = drivers.get(str(t.get("driver_id")))
+            d_name = d["name"] if d else f"Driver {t.get('driver_id','?')}"
+            lines.append(
+                f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED (driver: {d_name})"
+            )
+
+    return "\n".join(lines)
+
+
+def build_driver_weekly_report_text(data: Dict[str, Any], driver_telegram_id: int, start_dt: datetime, end_dt: datetime) -> str:
+    totals = compute_weekly_totals(data, start_dt, end_dt, driver_id=driver_telegram_id)
+    header = format_period_header(start_dt)
+
+    drv = get_driver_by_telegram_id(data, driver_telegram_id) or get_driver_by_any_id(data, driver_telegram_id)
+    name = drv["name"] if drv else f"Driver {driver_telegram_id}"
+    sid = drv.get("short_id") if drv else None
+
+    # From / until (since last payment for this driver)
+    lp = totals["last_payment_ts"]
+    if lp is None:
         from_dt = start_dt
     else:
-        from_dt = last_payment_ts
+        from_dt = lp
 
-    # Ensure Dubai tz
     if from_dt.tzinfo is None:
         from_dt = from_dt.replace(tzinfo=DUBAI_TZ)
     else:
         from_dt = from_dt.astimezone(DUBAI_TZ)
 
-    if end_dt.tzinfo is None:
-        until_dt = end_dt.replace(tzinfo=DUBAI_TZ)
+    until_dt = totals["end_ts"]
+    if until_dt.tzinfo is None:
+        until_dt = until_dt.replace(tzinfo=DUBAI_TZ)
     else:
-        until_dt = end_dt.astimezone(DUBAI_TZ)
+        until_dt = until_dt.astimezone(DUBAI_TZ)
 
     fmt = "%d-%m-%Y %I:%M %p"
     from_str = from_dt.strftime(fmt)
     until_str = until_dt.strftime(fmt)
 
     lines = [
-        "📊 Weekly Driver Report",
-        f"Period: {start_date_str} → {end_date_str}",
+        f"🚕 Weekly Driver Report — {name} (ID: {driver_telegram_id}, SID: {sid})",
+        header,
         "",
         "🎓 School base (daily):",
         f"• Weekly base: {totals['base_weekly']:.2f} AED",
@@ -381,38 +515,17 @@ def format_weekly_report_body(
         f"• No-school / holiday days in this period: {totals['no_school_days']}",
         f"• School base total: {totals['school_base_total']:.2f} AED",
         "",
-        "🚗 Extra trips (REAL):",
+        "🚗 Extra trips (REAL, unpaid):",
         f"• Count: {len(totals['real_trips'])}",
         f"• Extra total: {totals['total_extra']:.2f} AED",
         "",
-        f"✅ Grand total: {totals['grand_total']:.2f} AED",
+        f"✅ Grand total (base + unpaid trips): {totals['grand_total']:.2f} AED",
         "",
-        "🧾 Trips counted since last payment:",
+        "🧾 Trips counted since last payment for this driver:",
         f"🟢 From: {from_str}",
         f"🔵 Until: {until_str}",
     ]
-    return "\n".join(lines)
 
-
-def build_weekly_report_text(data: Dict[str, Any], start_dt: datetime, end_dt: datetime) -> str:
-    totals = compute_weekly_totals(data, start_dt, end_dt)
-    lines = format_weekly_report_body(data, totals, start_dt, end_dt).split("\n")
-    if totals["real_trips"]:
-        lines.append("")
-        lines.append("📋 Trip details (REAL):")
-        for t in sorted(totals["real_trips"], key=lambda x: x["id"]):
-            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
-            d_str = dt.strftime("%Y-%m-%d")
-            lines.append(
-                f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED "
-                f"(driver {t.get('driver_id','?')})"
-            )
-    return "\n".join(lines)
-
-
-def build_driver_weekly_report(data: Dict[str, Any], driver_id: int, start_dt: datetime, end_dt: datetime) -> str:
-    totals = compute_weekly_totals(data, start_dt, end_dt, driver_id=driver_id)
-    lines = format_weekly_report_body(data, totals, start_dt, end_dt).split("\n")
     if totals["real_trips"]:
         lines.append("")
         lines.append("📋 Trip details:")
@@ -422,6 +535,7 @@ def build_driver_weekly_report(data: Dict[str, Any], driver_id: int, start_dt: d
             lines.append(
                 f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED"
             )
+
     return "\n".join(lines)
 
 
@@ -481,18 +595,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             data["admin_chats"].append(chat.id)
             save_data(data)
         msg = (
-            "👋 DriverSchoolBot 2.0 — Admin\n\n"
+            "👋 DriverSchoolBot 3.0 — Admin\n\n"
             "Use /menu or the buttons.\n\n"
             "Main commands:\n"
-            "• /setbase <amount>\n"
+            "• /setbase <amount> (default weekly base)\n"
             "• /setweekstart <YYYY-MM-DD>\n"
+            "• /adddriver <telegram_id> <name>\n"
+            "• /setdriverbase <driver_code> <amount>\n"
             "• /trip <amount> <destination>\n"
-            "• /tripfor <driver id> <amount> <destination>\n"
-            "• /report — weekly\n"
-            "• /paid — close all trips up to now\n"
+            "• /tripfor <driver_code> <amount> <destination>\n"
+            "• /report (weekly, all drivers)\n"
+            "• /paydriver <driver_code> (close trips for one driver)\n"
+            "• /paid (close trips for ALL drivers)\n"
+            "• /listunpaid <driver_code> (unpaid trips for one driver)\n"
             "• /noschool today|tomorrow|YYYY-MM-DD\n"
             "• /removeschool YYYY-MM-DD\n"
             "• /clearnoschool\n"
+            "Note: driver_code can be Telegram ID or SID.\n"
         )
         if update.message:
             await update.message.reply_text(msg, reply_markup=admin_main_keyboard())
@@ -502,8 +621,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_driver_user(data, uid):
         d = data["drivers"].get(str(uid))
         name = d["name"] if d else "driver"
+        sid = d.get("short_id") if d else None
         msg = (
-            f"🚕 Welcome, {name}!\n\n"
+            f"🚕 Welcome, {name} (SID: {sid})!\n\n"
             "Use the buttons:\n"
             "• \"📦 My Week\" – short summary\n"
             "• \"🧾 My Weekly Report\" – full details\n"
@@ -518,9 +638,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /menu — show correct keyboard based on user type.
-    """
     data = load_data()
     user = update.effective_user
     if not user:
@@ -529,18 +646,16 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if is_admin(uid):
         if update.message:
-            await update.message.reply_text(
-                "👨‍💼 Admin menu:",
-                reply_markup=admin_main_keyboard(),
-            )
+            await update.message.reply_text("👨‍💼 Admin menu:", reply_markup=admin_main_keyboard())
         return
 
     if is_driver_user(data, uid):
         d = data["drivers"].get(str(uid))
         name = d["name"] if d else "driver"
+        sid = d.get("short_id") if d else None
         if update.message:
             await update.message.reply_text(
-                f"🚕 Driver menu — {name}:",
+                f"🚕 Driver menu — {name} (SID: {sid}):",
                 reply_markup=driver_keyboard(),
             )
         return
@@ -565,7 +680,7 @@ async def setbase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = load_data()
     data["base_weekly"] = amount
     save_data(data)
-    await update.message.reply_text(f"✅ Weekly base updated to {amount:.2f} AED")
+    await update.message.reply_text(f"✅ Global weekly base (default) updated to {amount:.2f} AED")
 
 
 async def setweekstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,7 +707,7 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Usage: /adddriver <telegram_id> <name>")
         return
     try:
-        driver_id = int(context.args[0])
+        telegram_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("Driver Telegram ID must be a number.")
         return
@@ -602,81 +717,129 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     drivers = data["drivers"]
 
     first_driver = len(drivers) == 0
+    short_id = get_next_short_driver_id(data)
 
-    drivers[str(driver_id)] = {
-        "id": driver_id,
+    drivers[str(telegram_id)] = {
+        "id": telegram_id,
+        "short_id": short_id,
         "name": name,
         "active": True,
-        "is_primary": first_driver,  # first added becomes primary by default
+        "is_primary": first_driver,
+        "base_weekly": None,  # uses global default until you setdriverbase
+        "payments": [],
     }
     save_data(data)
 
     flag = " (primary)" if first_driver else ""
-    # Message to admin who added
-    await update.message.reply_text(f"✅ Driver added: {name} ({driver_id}){flag}")
+    await update.message.reply_text(
+        f"✅ Driver added: {name} (ID: {telegram_id}, SID: {short_id}){flag}"
+    )
 
     # Try to notify the driver
     welcome_msg = (
         f"🚕 Hello {name}!\n\n"
         "You have been added as a driver in DriverSchoolBot.\n"
-        "Use /start to open your driver menu and see your weekly report and summary."
+        "Your short ID (SID) is "
+        f"{short_id}. Use /start to open your driver menu and see your weekly report."
     )
     try:
-        await context.bot.send_message(
-            chat_id=driver_id,
-            text=welcome_msg,
-        )
+        await context.bot.send_message(chat_id=telegram_id, text=welcome_msg)
     except Exception:
-        # If the driver never started the bot, Telegram will block this — just ignore.
         pass
 
 
+async def setdriverbase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /setdriverbase <driver_code> <amount>
+    driver_code can be Telegram ID or SID.
+    """
+    if not await ensure_admin(update):
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /setdriverbase <driver_code> <amount>")
+        return
+    try:
+        code = int(context.args[0])
+        amount = float(context.args[1])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Driver code and amount must be numbers, amount > 0.")
+        return
+
+    data = load_data()
+    drv = get_driver_by_any_id(data, code)
+    if not drv:
+        await update.message.reply_text("Driver not found by this code.")
+        return
+
+    drv["base_weekly"] = amount
+    save_data(data)
+    await update.message.reply_text(
+        f"✅ Weekly base for driver {drv['name']} (ID: {drv['id']}, SID: {drv['short_id']}) "
+        f"set to {amount:.2f} AED"
+    )
+
+
 async def removedriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /removedriver <driver_code>  (Telegram ID or SID)
+    """
     if not await ensure_admin(update):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /removedriver <telegram_id>")
+        await update.message.reply_text("Usage: /removedriver <driver_code>")
         return
     try:
-        driver_id = int(context.args[0])
+        code = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Driver Telegram ID must be a number.")
+        await update.message.reply_text("Driver code must be a number (ID or SID).")
         return
+
     data = load_data()
     drivers = data["drivers"]
-    key = str(driver_id)
-    if key not in drivers:
+    drv = get_driver_by_any_id(data, code)
+    if not drv:
         await update.message.reply_text("Driver not found.")
         return
-    name = drivers[key]["name"]
-    del drivers[key]
+
+    name = drv["name"]
+    tid = drv["id"]
+    # remove by telegram id key
+    if str(tid) in drivers:
+        del drivers[str(tid)]
     save_data(data)
-    await update.message.reply_text(f"🗑 Driver removed: {name} ({driver_id})")
+    await update.message.reply_text(f"🗑 Driver removed: {name} (ID: {tid}, SID: {drv.get('short_id')})")
 
 
 async def setprimarydriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /setprimarydriver <driver_code> (Telegram ID or SID)
+    """
     if not await ensure_admin(update):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /setprimarydriver <telegram_id>")
+        await update.message.reply_text("Usage: /setprimarydriver <driver_code>")
         return
     try:
-        driver_id = int(context.args[0])
+        code = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Driver Telegram ID must be a number.")
+        await update.message.reply_text("Driver code must be a number (ID or SID).")
         return
+
     data = load_data()
-    drivers = data["drivers"]
-    key = str(driver_id)
-    if key not in drivers:
+    drv = get_driver_by_any_id(data, code)
+    if not drv:
         await update.message.reply_text("Driver not found.")
         return
+
+    drivers = data["drivers"]
     for d in drivers.values():
         d["is_primary"] = False
-    drivers[key]["is_primary"] = True
+    drv["is_primary"] = True
     save_data(data)
     await update.message.reply_text(
-        f"⭐ Primary driver set to {drivers[key]['name']} ({driver_id})"
+        f"⭐ Primary driver set to {drv['name']} (ID: {drv['id']}, SID: {drv['short_id']})"
     )
 
 
@@ -725,10 +888,9 @@ async def add_trip_common(
             f"📅 {pretty}\n"
             f"📍 {destination}\n"
             f"💰 {amount:.2f} AED\n"
-            f"🚕 Driver: {driver['name']} ({driver['id']})"
+            f"🚕 Driver: {driver['name']} (ID: {driver['id']}, SID: {driver.get('short_id')})"
         )
 
-    # Notifications only for REAL trips
     if not is_test:
         # Notify admins
         admin_msg = (
@@ -738,7 +900,7 @@ async def add_trip_common(
             f"📍 {destination}\n"
             f"💰 {amount:.2f} AED\n"
             f"👤 Added by Telegram ID: {trip['user_id']}\n"
-            f"🚗 For driver: {driver['name']} ({driver['id']})"
+            f"🚗 For driver: {driver['name']} (ID: {driver['id']}, SID: {driver.get('short_id')})"
         )
         for chat_id in data.get("admin_chats", []):
             try:
@@ -786,25 +948,31 @@ async def trip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def tripfor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /tripfor <driver_code> <amount> <destination>
+    driver_code can be Telegram ID or SID.
+    """
     if not await ensure_admin(update):
         return
     if len(context.args) < 3:
         await update.message.reply_text(
-            "Usage: /tripfor <driver_id> <amount> <destination>\n"
-            "Example: /tripfor 981113059 40 Dubai Mall"
+            "Usage: /tripfor <driver_code> <amount> <destination>\n"
+            "Example: /tripfor 1 40 Dubai Mall (SID 1)\n"
+            "Or: /tripfor 981113059 40 Dubai Mall (Telegram ID)"
         )
         return
     try:
-        driver_id = int(context.args[0])
+        code = int(context.args[0])
         amount = float(context.args[1])
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("Driver ID must be int, amount positive number.")
+        await update.message.reply_text("Driver code must be int, amount positive number.")
         return
+
     destination = " ".join(context.args[2:])
     data = load_data()
-    driver = get_driver_by_id(data, driver_id)
+    driver = get_driver_by_any_id(data, code)
     if not driver or not driver.get("active", True):
         await update.message.reply_text("Driver not found or inactive.")
         return
@@ -843,7 +1011,82 @@ async def list_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("\n".join(lines))
 
 
+async def listunpaid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /listunpaid <driver_code>
+    Show all unpaid REAL trips for a driver (after his last payment, and after week_start_date if set).
+    driver_code can be Telegram ID or SID.
+    """
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /listunpaid <driver_code>")
+        return
+    try:
+        code = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver code must be a number (ID or SID).")
+        return
+
+    data = load_data()
+    drv = get_driver_by_any_id(data, code)
+    if not drv:
+        await update.message.reply_text("Driver not found.")
+        return
+
+    driver_id = drv["id"]
+    last_payment_ts = get_last_payment_for_driver(data, driver_id)
+    week_start_str = data.get("week_start_date")
+    floor_date = parse_date_str(week_start_str) if week_start_str else None
+
+    trips = data.get("trips", [])
+    unpaid: List[Dict[str, Any]] = []
+    for t in trips:
+        if t.get("is_test", False):
+            continue
+        if t.get("driver_id") != driver_id:
+            continue
+        try:
+            dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        except Exception:
+            continue
+
+        # Respect week_start_date as minimum date
+        if floor_date and dt.date() < floor_date:
+            continue
+
+        if last_payment_ts and dt <= last_payment_ts:
+            continue
+
+        unpaid.append(t)
+
+    if not unpaid:
+        await update.message.reply_text(
+            f"ℹ️ No unpaid REAL trips for {drv['name']} (ID: {drv['id']}, SID: {drv['short_id']})."
+        )
+        return
+
+    total = sum(t["amount"] for t in unpaid)
+    lines = [
+        f"📋 Unpaid trips for {drv['name']} (ID: {drv['id']}, SID: {drv['short_id']}):",
+        "",
+    ]
+    for t in sorted(unpaid, key=lambda x: x["id"]):
+        dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
+        d_str = dt.strftime("%Y-%m-%d %H:%M")
+        lines.append(
+            f"- ID {t['id']}: {d_str} — {t['destination']} — {t['amount']:.2f} AED"
+        )
+    lines.append("")
+    lines.append(f"💰 Total unpaid: {total:.2f} AED")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Weekly admin report (all drivers, unpaid trips only).
+    """
     if not await ensure_admin(update):
         return
     data = load_data()
@@ -852,11 +1095,14 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         wd = data.get("week_start_date")
         await update.message.reply_text(f"ℹ️ Work starts from {wd}. No report yet.")
         return
-    text = build_weekly_report_text(data, start_dt, end_dt)
+    text = build_admin_weekly_report_text(data, start_dt, end_dt)
     await update.message.reply_text(text)
 
 
 async def driver_week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Driver weekly report when driver clicks "My Week" or "My Weekly Report".
+    """
     data = load_data()
     user = update.effective_user
     if not user:
@@ -870,31 +1116,62 @@ async def driver_week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         wd = data.get("week_start_date")
         await update.message.reply_text(f"ℹ️ Work starts from {wd}. No report yet.")
         return
-    txt = build_driver_weekly_report(data, user.id, start_dt, end_dt)
+    txt = build_driver_weekly_report_text(data, user.id, start_dt, end_dt)
     await update.message.reply_text(txt)
+
+
+async def paydriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /paydriver <driver_code>  (Telegram ID or SID)
+    Close trips for one driver up to now.
+    """
+    if not await ensure_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /paydriver <driver_code>")
+        return
+    try:
+        code = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Driver code must be a number (ID or SID).")
+        return
+
+    data = load_data()
+    drv = get_driver_by_any_id(data, code)
+    if not drv:
+        await update.message.reply_text("Driver not found.")
+        return
+
+    now = now_dubai()
+    drv.setdefault("payments", [])
+    drv["payments"].append(now.isoformat())
+    save_data(data)
+
+    pretty = now.strftime("%Y-%m-%d %H:%M")
+    await update.message.reply_text(
+        f"💸 Payment checkpoint for {drv['name']} "
+        f"(ID: {drv['id']}, SID: {drv['short_id']}) saved at {pretty}.\n"
+        f"Next report for this driver will count trips after this time."
+    )
 
 
 async def paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /paid — close all trips up to now.
-    Next weekly reports will only count trips after this moment.
+    /paid — close trips for ALL drivers up to now.
     """
     if not await ensure_admin(update):
         return
     data = load_data()
     now = now_dubai()
-    data.setdefault("payments", [])
-    data["payments"].append(
-        {
-            "timestamp": now.isoformat(),
-            "note": "manual /paid",
-        }
-    )
+    drivers = data.get("drivers", {})
+    for drv in drivers.values():
+        drv.setdefault("payments", [])
+        drv["payments"].append(now.isoformat())
     save_data(data)
     pretty = now.strftime("%Y-%m-%d %H:%M")
     await update.message.reply_text(
-        f"💸 Payment checkpoint saved at {pretty}.\n"
-        f"Next weekly report will count trips after this time."
+        f"💸 Payment checkpoint saved for ALL drivers at {pretty}.\n"
+        f"Next weekly reports will count trips after this time for each driver."
     )
 
 
@@ -959,16 +1236,14 @@ async def test_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+# ---------- No-school ----------
+
 async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_admin(update):
         return
 
     data = load_data()
 
-    # Support: /noschool          → today
-    #          /noschool today    → today
-    #          /noschool tomorrow → tomorrow
-    #          /noschool YYYY-MM-DD
     if context.args:
         arg = context.args[0].lower()
     else:
@@ -1008,7 +1283,7 @@ async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def removeschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /removeschool YYYY-MM-DD
-    Remove one no-school date. No driver notification.
+    Remove one no-school date (no driver notification).
     """
     if not await ensure_admin(update):
         return
@@ -1094,7 +1369,6 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ]
         save_data(data)
 
-        # Reuse noschool_cmd logic
         context.args = [format_date(d)]
         await noschool_cmd(update, context)
 
@@ -1135,10 +1409,10 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Use /adddriver <telegram_id> <name>")
         return
     if txt == BTN_DRIVERS_REMOVE:
-        await update.message.reply_text("Use /removedriver <telegram_id>")
+        await update.message.reply_text("Use /removedriver <driver_code> (ID or SID)")
         return
     if txt == BTN_DRIVERS_SET_PRIMARY:
-        await update.message.reply_text("Use /setprimarydriver <telegram_id>")
+        await update.message.reply_text("Use /setprimarydriver <driver_code> (ID or SID)")
         return
     if txt == BTN_NOSCHOOL_MENU:
         await update.message.reply_text("🏫 No School:", reply_markup=noschool_keyboard())
@@ -1152,7 +1426,6 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await noschool_cmd(update, context)
         return
     if txt == BTN_NOSCHOOL_PICKDATE:
-        # Add this chat to awaiting_noschool_date
         if chat and chat.id not in data["awaiting_noschool_date"]:
             data["awaiting_noschool_date"].append(chat.id)
             save_data(data)
@@ -1211,6 +1484,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setweekstart", setweekstart_cmd))
 
     app.add_handler(CommandHandler("adddriver", adddriver_cmd))
+    app.add_handler(CommandHandler("setdriverbase", setdriverbase_cmd))
     app.add_handler(CommandHandler("removedriver", removedriver_cmd))
     app.add_handler(CommandHandler("drivers", drivers_cmd))
     app.add_handler(CommandHandler("setprimarydriver", setprimarydriver_cmd))
@@ -1218,7 +1492,9 @@ def main() -> None:
     app.add_handler(CommandHandler("trip", trip_cmd))
     app.add_handler(CommandHandler("tripfor", tripfor_cmd))
     app.add_handler(CommandHandler("list", list_trips_cmd))
+    app.add_handler(CommandHandler("listunpaid", listunpaid_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("paydriver", paydriver_cmd))
     app.add_handler(CommandHandler("paid", paid_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("cleartrips", cleartrips_cmd))

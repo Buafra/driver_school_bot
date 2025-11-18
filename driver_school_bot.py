@@ -1467,6 +1467,7 @@ async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await driver_week_cmd(update, context)
 
 # ---------- AI ----------
+# ---------- AI ----------
 from openai import OpenAI
 import os
 import logging
@@ -1483,19 +1484,19 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-       completion = client.chat.completions.create(
-    model="gpt-4.1-mini",
-    messages=[
-        {
-            "role": "system",
-            "content": (
-                "You are an assistant for Faisal's driver bot. "
-                "Explain things clearly and simply."
-            ),
-        },
-        {"role": "user", "content": user_text},
-    ],
-)
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistant for Faisal's driver bot. "
+                        "Explain things clearly and simply."
+                    ),
+                },
+                {"role": "user", "content": user_text},
+            ],
+        )
 
         reply = completion.choices[0].message.content
         await update.message.reply_text(reply)
@@ -1505,7 +1506,6 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"⚠️ AI is not working right now.\nError: {e}"
         )
-
 
 
 # ---------- Main ----------

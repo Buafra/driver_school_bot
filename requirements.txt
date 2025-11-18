@@ -1,2 +1,3 @@
 python-telegram-bot[job-queue]==21.4
-pip install --upgrade openai
+openai>=1.53
+# (other packages you already have)

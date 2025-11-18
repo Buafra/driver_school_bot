@@ -1483,19 +1483,19 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        completion = client.chat.completions.create(
-            model="gpt-5.1-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an assistant for Faisal's driver bot. "
-                        "Explain things clearly and simply."
-                    ),
-                },
-                {"role": "user", "content": user_text},
-            ],
-        )
+       completion = client.chat.completions.create(
+    model="gpt-4.1-mini",
+    messages=[
+        {
+            "role": "system",
+            "content": (
+                "You are an assistant for Faisal's driver bot. "
+                "Explain things clearly and simply."
+            ),
+        },
+        {"role": "user", "content": user_text},
+    ],
+)
 
         reply = completion.choices[0].message.content
         await update.message.reply_text(reply)

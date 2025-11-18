@@ -1482,14 +1482,19 @@ async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     completion = client.chat.completions.create(
         model="gpt-5.1-mini",
         messages=[
-            {"role": "system",
-             "content": "You are an assistant for Faisal's driver bot. "
-                        "Explain things clearly and simply."},
-            {"role": "user", "content": user_text}
+            {
+                "role": "system",
+                "content": (
+                    "You are an assistant for Faisal's driver bot. "
+                    "Explain things clearly and simply."
+                ),
+            },
+            {"role": "user", "content": user_text},
         ],
     )
 
     await update.message.reply_text(completion.choices[0].message.content)
+
 
 # ---------- Main ----------
 
@@ -1527,7 +1532,9 @@ def main() -> None:
     app.add_handler(CommandHandler("noschool", noschool_cmd))
     app.add_handler(CommandHandler("removeschool", removeschool_cmd))
     app.add_handler(CommandHandler("clearnoschool", clearnoschool_cmd))
-    application.add_handler(CommandHandler("ai", ai_chat))
+
+    # ✅ AI command – use `app`, not `application`
+    app.add_handler(CommandHandler("ai", ai_chat))
 
     # Text handlers
     # Admin buttons / quick trips

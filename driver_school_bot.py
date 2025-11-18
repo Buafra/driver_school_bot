@@ -1,5 +1,5 @@
 # driver_school_bot.py
-# DriverSchoolBot 2.0 — clean version (updated)
+# DriverSchoolBot 2.0 — clean version (updated, no Markdown parsing)
 #
 # Features:
 # - Admins vs drivers
@@ -7,12 +7,11 @@
 # - Extra trips (REAL vs TEST)
 # - /paid closes all trips up to that moment
 # - Weekly report counts ONLY trips after last payment
-# - "Trips counted since last payment" block (Option C)
-# - /noschool today / tomorrow / YYYY-MM-DD
-# - No-school menu buttons + driver notifications
+# - "Trips counted since last payment" block
+# - /noschool today|tomorrow|YYYY-MM-DD + driver notifications
 # - Trip notifications to admins + driver
 # - Driver welcome message on /adddriver
-# - Simple /menu for admin & driver keyboards
+# - /menu for admin & driver keyboards
 
 import os
 import json
@@ -75,6 +74,7 @@ BTN_BACK_MAIN = "⬅ Back"
 # Buttons — Driver menu (for drivers themselves)
 BTN_DRIVER_MY_WEEK = "📦 My Week"
 BTN_DRIVER_MY_REPORT = "🧾 My Weekly Report"
+
 
 # ---------- Data helpers ----------
 
@@ -174,12 +174,12 @@ def drivers_list_text(data: Dict[str, Any]) -> str:
     drivers = data.get("drivers", {})
     if not drivers:
         return "No drivers added yet."
-    lines = ["🚕 *Drivers list:*"]
+    lines = ["🚕 Drivers list:"]
     for d in drivers.values():
         flag = "⭐ Primary" if d.get("is_primary", False) else ""
         active = "✅ Active" if d.get("active", True) else "❌ Inactive"
         lines.append(
-            f"- ID: `{d['id']}` — *{d['name']}* ({active}) {flag}"
+            f"- ID: {d['id']} — {d['name']} ({active}) {flag}"
         )
     return "\n".join(lines)
 
@@ -461,19 +461,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             data["admin_chats"].append(chat.id)
             save_data(data)
         msg = (
-            "👋 *DriverSchoolBot 2.0 — Admin*\n\n"
+            "👋 DriverSchoolBot 2.0 — Admin\n\n"
             "Use /menu or the buttons.\n\n"
             "Main commands:\n"
             "• /setbase <amount>\n"
             "• /setweekstart <YYYY-MM-DD>\n"
             "• /trip <amount> <destination>\n"
-            "• /tripfor <driver_id> <amount> <destination>\n"
+            "• /tripfor <driver id> <amount> <destination>\n"
             "• /report — weekly\n"
             "• /paid — close all trips up to now\n"
             "• /noschool today|tomorrow|YYYY-MM-DD\n"
         )
         if update.message:
-            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_main_keyboard())
+            await update.message.reply_text(msg, reply_markup=admin_main_keyboard())
         return
 
     # Driver
@@ -481,13 +481,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         d = data["drivers"].get(str(uid))
         name = d["name"] if d else "driver"
         msg = (
-            f"🚕 *Welcome, {name}!* \n\n"
+            f"🚕 Welcome, {name}!\n\n"
             "Use the buttons:\n"
             "• \"📦 My Week\" – short summary\n"
             "• \"🧾 My Weekly Report\" – full details\n"
         )
         if update.message:
-            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=driver_keyboard())
+            await update.message.reply_text(msg, reply_markup=driver_keyboard())
         return
 
     # Not authorized
@@ -596,14 +596,13 @@ async def adddriver_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Try to notify the driver
     welcome_msg = (
         f"🚕 Hello {name}!\n\n"
-        "You have been added as a driver in *DriverSchoolBot*.\n"
+        "You have been added as a driver in DriverSchoolBot.\n"
         "Use /start to open your driver menu and see your weekly report and summary."
     )
     try:
         await context.bot.send_message(
             chat_id=driver_id,
             text=welcome_msg,
-            parse_mode="Markdown",
         )
     except Exception:
         # If the driver never started the bot, Telegram will block this — just ignore.
@@ -664,7 +663,7 @@ async def drivers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     data = load_data()
     txt = drivers_list_text(data)
-    await update.message.reply_text(txt, parse_mode="Markdown")
+    await update.message.reply_text(txt)
 
 
 async def add_trip_common(
@@ -800,7 +799,7 @@ async def list_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     real_total = 0.0
     test_total = 0.0
-    lines = ["📋 *All trips (REAL + TEST):*"]
+    lines = ["📋 All trips (REAL + TEST):"]
     for t in sorted(trips, key=lambda x: x["id"]):
         dt = parse_iso_datetime(t["date"]).astimezone(DUBAI_TZ)
         d_str = dt.strftime("%Y-%m-%d")
@@ -819,7 +818,7 @@ async def list_trips_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines.append("")
     lines.append(f"💰 REAL trips total: {real_total:.2f} AED")
     lines.append(f"🧪 TEST trips total (ignored in weekly totals): {test_total:.2f} AED")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1021,7 +1020,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("🚕 Drivers:", reply_markup=drivers_keyboard())
         return
     if txt == BTN_DRIVERS_LIST:
-        await update.message.reply_text(drivers_list_text(data), parse_mode="Markdown")
+        await update.message.reply_text(drivers_list_text(data))
         return
     if txt == BTN_DRIVERS_ADD:
         await update.message.reply_text("Use /adddriver <telegram_id> <name>")
@@ -1132,6 +1131,7 @@ def main() -> None:
         )
     )
 
+    # Disable signal handling (for Render)
     app.run_polling(stop_signals=())
 
 

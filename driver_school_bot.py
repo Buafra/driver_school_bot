@@ -1,21 +1,23 @@
 # driver_school_bot.py
-# DriverSchoolBot 2.0 — clean version (updated, no Markdown parsing)
+# DriverSchoolBot 2.0 — with /paid, driver weekly report, and no-school pick date
 #
 # Features:
 # - Admins vs drivers
 # - Weekly school base with /setbase and /setweekstart
 # - Extra trips (REAL vs TEST)
-# - /paid closes all trips up to that moment
+# - /paid closes all trips up to now
 # - Weekly report counts ONLY trips after last payment
-# - "Trips counted since last payment" block
-# - /noschool today|tomorrow|YYYY-MM-DD + driver notifications
-# - Trip notifications to admins + driver
+# - Driver weekly report (buttons: 📦 My Week / 🧾 My Weekly Report)
+# - /noschool today|tomorrow|YYYY-MM-DD + button for pick date
+# - No-school notifications to all drivers
+# - Trip notifications to admins + target driver
 # - Driver welcome message on /adddriver
 # - /menu for admin & driver keyboards
+# - No Markdown parsing (no entity errors)
 
 import os
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -63,6 +65,7 @@ BTN_PAID = "💸 Paid (Close Week)"
 # No-school menu buttons
 BTN_NOSCHOOL_TODAY = "🏫 No School Today"
 BTN_NOSCHOOL_TOMORROW = "🏫 No School Tomorrow"
+BTN_NOSCHOOL_PICKDATE = "📅 No School (Pick Date)"
 
 # Buttons — Drivers submenu
 BTN_DRIVERS_LIST = "🚕 List Drivers"
@@ -92,14 +95,15 @@ def load_data() -> Dict[str, Any]:
         data = {}
 
     data.setdefault("base_weekly", DEFAULT_BASE_WEEKLY)
-    data.setdefault("week_start_date", None)  # "YYYY-MM-DD" or None
-    data.setdefault("trips", [])              # list of trip dicts
+    data.setdefault("week_start_date", None)      # "YYYY-MM-DD" or None
+    data.setdefault("trips", [])                  # list of trip dicts
     data.setdefault("next_trip_id", 1)
-    data.setdefault("no_school_dates", [])    # list of "YYYY-MM-DD"
-    data.setdefault("drivers", {})            # {str(telegram_id): {...}}
-    data.setdefault("admin_chats", [])        # list of chat_ids
+    data.setdefault("no_school_dates", [])        # list of "YYYY-MM-DD"
+    data.setdefault("drivers", {})                # {str(telegram_id): {...}}
+    data.setdefault("admin_chats", [])            # list of chat_ids
     data.setdefault("test_mode", False)
-    data.setdefault("payments", [])           # list of {"timestamp": iso, "note": str}
+    data.setdefault("payments", [])               # list of {"timestamp": iso, "note": str}
+    data.setdefault("awaiting_noschool_date", []) # list of admin chat_ids awaiting date
 
     return data
 
@@ -423,6 +427,15 @@ def admin_main_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(BTN_NOSCHOOL_MENU), KeyboardButton(BTN_DRIVERS_MENU)],
         [KeyboardButton(BTN_CLEAR_TRIPS), KeyboardButton(BTN_TOGGLE_TEST)],
         [KeyboardButton(BTN_PAID)],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def noschool_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(BTN_NOSCHOOL_TODAY), KeyboardButton(BTN_NOSCHOOL_TOMORROW)],
+        [KeyboardButton(BTN_NOSCHOOL_PICKDATE)],
+        [KeyboardButton(BTN_BACK_MAIN)],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -837,7 +850,11 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def driver_week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = load_data()
     user = update.effective_user
-    if not user or not is_driver_user(data, user.id):
+    if not user:
+        return
+    if not is_driver_user(data, user.id):
+        if update.message:
+            await update.message.reply_text("You are not registered as a driver.")
         return
     start_dt, end_dt = weekly_range_now(data)
     if start_dt is None:
@@ -983,14 +1000,37 @@ async def noschool_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle admin text buttons & quick trip (e.g., '70 Dubai Mall').
+    Handle admin text buttons & quick trip (e.g., '70 Dubai Mall'),
+    and no-school pick date input.
     """
     data = load_data()
     user = update.effective_user
+    chat = update.effective_chat
     if not user or not is_admin(user.id):
         return
 
     txt = (update.message.text or "").strip()
+
+    # Are we waiting for a no-school date from this admin?
+    if chat and chat.id in data.get("awaiting_noschool_date", []):
+        try:
+            d = parse_date_str(txt)
+        except Exception:
+            await update.message.reply_text("Please send date as YYYY-MM-DD.\nExample: 2025-12-02")
+            return
+
+        # Stop waiting
+        data["awaiting_noschool_date"] = [
+            cid for cid in data["awaiting_noschool_date"] if cid != chat.id
+        ]
+        save_data(data)
+
+        # Reuse noschool_cmd logic
+        context.args = [format_date(d)]
+        await noschool_cmd(update, context)
+
+        await update.message.reply_text("Back to main No School menu.", reply_markup=noschool_keyboard())
+        return
 
     # Buttons
     if txt == BTN_ADD_TRIP:
@@ -1032,16 +1072,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Use /setprimarydriver <telegram_id>")
         return
     if txt == BTN_NOSCHOOL_MENU:
-        await update.message.reply_text(
-            "🏫 No School:",
-            reply_markup=ReplyKeyboardMarkup(
-                [
-                    [KeyboardButton(BTN_NOSCHOOL_TODAY), KeyboardButton(BTN_NOSCHOOL_TOMORROW)],
-                    [KeyboardButton(BTN_BACK_MAIN)],
-                ],
-                resize_keyboard=True,
-            ),
-        )
+        await update.message.reply_text("🏫 No School:", reply_markup=noschool_keyboard())
         return
     if txt == BTN_NOSCHOOL_TODAY:
         context.args = ["today"]
@@ -1050,6 +1081,15 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if txt == BTN_NOSCHOOL_TOMORROW:
         context.args = ["tomorrow"]
         await noschool_cmd(update, context)
+        return
+    if txt == BTN_NOSCHOOL_PICKDATE:
+        # Add this chat to awaiting_noschool_date
+        if chat and chat.id not in data["awaiting_noschool_date"]:
+            data["awaiting_noschool_date"].append(chat.id)
+            save_data(data)
+        await update.message.reply_text(
+            "📅 Send the date as YYYY-MM-DD for no school.\nExample: 2025-12-02"
+        )
         return
     if txt == BTN_BACK_MAIN:
         await update.message.reply_text("Back to main menu.", reply_markup=admin_main_keyboard())
@@ -1085,6 +1125,10 @@ async def driver_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         await driver_week_cmd(update, context)
 
 
+# ---------- Jobs (optional, if you want to add later) ----------
+# For now, no scheduled jobs — reports are manual (/report, /paid)
+
+
 # ---------- Main ----------
 
 def main() -> None:
@@ -1118,12 +1162,14 @@ def main() -> None:
     app.add_handler(CommandHandler("noschool", noschool_cmd))
 
     # Text handlers
+    # Admin buttons / quick trips
     app.add_handler(
         MessageHandler(
-            filters.TEXT & (~filters.COMMAND),
+            filters.TEXT & (~filters.COMMAND) & filters.User(user_id=ALLOWED_ADMINS),
             admin_menu_handler,
         )
     )
+    # Driver buttons
     app.add_handler(
         MessageHandler(
             filters.TEXT & (~filters.COMMAND),
